@@ -599,7 +599,7 @@ mod imp {
     #[cfg(target_os = "macos")]
     use objc2::MainThreadMarker;
     #[cfg(target_os = "macos")]
-    use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn};
+    use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSApplication};
     #[cfg(target_os = "macos")]
     use objc2_foundation::NSString;
     #[cfg(target_os = "macos")]
@@ -741,14 +741,17 @@ mod imp {
         };
         // The dashboard's --base until the page reports what it shows under the titlebar.
         #[cfg(target_os = "macos")]
-        set_titlebar_color(
-            &window,
-            None,
-            match window.theme() {
-                Theme::Dark => [0x0e, 0x0c, 0x0c],
-                _ => [0xff, 0xff, 0xff],
-            },
-        );
+        {
+            disable_fullscreen_escape(&window);
+            set_titlebar_color(
+                &window,
+                None,
+                match window.theme() {
+                    Theme::Dark => [0x0e, 0x0c, 0x0c],
+                    _ => [0xff, 0xff, 0xff],
+                },
+            );
+        }
 
         let shown = Rc::new(Cell::new(false));
         let replaced = Rc::new(RefCell::new(HashMap::new()));
@@ -926,9 +929,9 @@ mod imp {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                // Closing hides, like other Mac apps; the Dock icon brings it back.
                 #[cfg(target_os = "macos")]
-                window.set_visible(false);
+                // AppKit switches Spaces when hiding the app, unlike ordering out its window.
+                NSApplication::sharedApplication(MainThreadMarker::new().unwrap()).hide(None);
                 #[cfg(not(target_os = "macos"))]
                 begin_quit(&mut quit, &window, &webview, control_flow);
             }
@@ -940,6 +943,36 @@ mod imp {
             }
             _ => {}
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn disable_fullscreen_escape(window: &Window) {
+        use tao::platform::macos::WindowExtMacOS;
+        type CancelOperation = unsafe extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject);
+        // WebKit handles Escape first; don't let the window's fallback exit fullscreen.
+        unsafe {
+            let ns_window = &*window.ns_window().cast::<AnyObject>();
+            let class: *const AnyClass = ns_window.class();
+            let imp: CancelOperation = ignore_cancel_operation;
+            assert!(
+                objc2::ffi::class_addMethod(
+                    class.cast_mut(),
+                    objc2::sel!(cancelOperation:),
+                    std::mem::transmute::<CancelOperation, objc2::runtime::Imp>(imp),
+                    c"v@:@".as_ptr(),
+                )
+                .as_bool(),
+                "could not disable the window's fullscreen Escape action"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C-unwind" fn ignore_cancel_operation(
+        _this: &AnyObject,
+        _cmd: Sel,
+        _sender: *mut AnyObject,
+    ) {
     }
 
     fn begin_quit(
