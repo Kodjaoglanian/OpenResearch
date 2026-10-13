@@ -2337,7 +2337,10 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         .unwrap_or_default();
 
     for rel in entries.keys() {
-        if acts.iter().all(|a| a.rel() != rel.as_str()) {
+        if acts.iter().all(|a| {
+            a.rel() != rel.as_str()
+                && !matches!(a, Act::Revert(parent) if rel.starts_with(&format!("{parent}/")))
+        }) {
             acts.push(Act::Revert(rel.clone()));
         }
     }
@@ -2519,7 +2522,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                         prune_empty_dirs(parent, target);
                     }
                 }
-                entries.remove(rel);
+                entries.insert(rel.clone(), String::new());
             }
             Act::Revert(rel) => match base_entry(target, base, rel)? {
                 None => {
@@ -3453,6 +3456,57 @@ mod tests {
         // nothing — the hub already holds the synced state.
         let again = sync_worktree_changes(&wt, &base, &hub).unwrap();
         assert_eq!(again, SyncOutcome::default());
+
+        // A synced deletion still belongs to this source until it is restored.
+        run(
+            &wt,
+            &[
+                "restore",
+                "--staged",
+                "--worktree",
+                "--source",
+                &base,
+                "--",
+                "gone.txt",
+            ],
+        );
+        let restored = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert!(restored.conflicts.is_empty());
+        assert_eq!(restored.copied, 1);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("gone.txt")).unwrap(),
+            "delete me\n"
+        );
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+        run(&wt, &["rm", "-q", "gone.txt"]);
+        assert_eq!(sync_worktree_changes(&wt, &base, &hub).unwrap().deleted, 1);
+        write(&hub, "gone.txt", "user replacement\n");
+        run(
+            &wt,
+            &[
+                "restore",
+                "--staged",
+                "--worktree",
+                "--source",
+                &base,
+                "--",
+                "gone.txt",
+            ],
+        );
+        let blocked = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(blocked.conflicts, vec!["gone.txt".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("gone.txt")).unwrap(),
+            "user replacement\n"
+        );
+        std::fs::remove_file(hub.join("gone.txt")).unwrap();
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
 
         // A third sync after more worktree edits copies the file again: the
         // manifest marks the hub's copy as this source's own, not a user edit.
