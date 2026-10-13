@@ -2367,24 +2367,52 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                 dest: &Path,
                 desired: &str|
      -> Result<bool> {
+        // Every ancestor the write passes through must be a directory,
+        // missing, or itself removed by this sync — a stray file there blocks
+        // path creation.
+        let mut ancestor = String::new();
+        for part in rel.split('/') {
+            if !ancestor.is_empty() {
+                let pcur = fingerprint(&safe_target_path(target, &ancestor)?);
+                if !(pcur.is_empty() || pcur == "dir" || removals.contains(ancestor.as_str())) {
+                    return Ok(false);
+                }
+            }
+            if !ancestor.is_empty() {
+                ancestor.push('/');
+            }
+            ancestor.push_str(part);
+        }
         let current = fingerprint(dest);
-        if current == desired
-            || entries.get(rel).is_some_and(|fp| fp == &current)
-            || current
-                == base_entry(target, base, rel)?
-                    .map(|e| e.fingerprint())
-                    .unwrap_or_default()
-        {
+        // A directory coming back from the base is checked per entry the
+        // restore writes, not by the equality rules below.
+        if desired == "dir" {
+            return revert_tree_ok(entries, target, base, rel, &current);
+        }
+        // A submodule pin has no content to land: keep the checkout there.
+        if desired == "gitlink" {
+            return Ok(current == "dir" || current.is_empty());
+        }
+        // Nothing at the destination means nothing to clobber — e.g. an
+        // emptied directory pruned by an earlier act in this same sync.
+        if current.is_empty() {
             return Ok(true);
         }
         // A directory may only be replaced when everything it still holds is
-        // itself being removed by this sync.
+        // itself being removed by this sync — fingerprint equality can never
+        // stand in for that check ("dir" matches any directory, including the
+        // base's).
         if current == "dir" {
             return Ok(files_inside(dest, target)
                 .iter()
                 .all(|f| removals.contains(f.as_str())));
         }
-        Ok(false)
+        Ok(current == desired
+            || entries.get(rel).is_some_and(|fp| fp == &current)
+            || current
+                == base_entry(target, base, rel)?
+                    .map(|e| e.fingerprint())
+                    .unwrap_or_default())
     };
 
     let mut plan = Vec::with_capacity(acts.len());
@@ -2418,8 +2446,6 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         // Re-check right before the write: an editor or another process racing
         // the scan still cannot be clobbered silently.
         if !safe(&entries, &rel, &dest, &desired)? {
-            manifest.sources.insert(source_key.clone(), entries.clone());
-            manifest.write(&manifest_path)?;
             return Err(anyhow!(
                 "the project folder changed {rel} during the sync — rerun it"
             ));
@@ -2442,7 +2468,8 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                                 anyhow!("could not create {}: {}", parent.display(), e)
                             })?;
                         }
-                        create_symlink(&std::fs::read_link(&src)?, &dest)?;
+                        crate::local::native_store::copy_symlink(&src, &dest)
+                            .map_err(|e| anyhow!("could not link {}: {}", dest.display(), e))?;
                         outcome.copied += 1;
                     }
                 } else if meta.is_file() {
@@ -2481,7 +2508,9 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                 } else {
                     continue;
                 }
-                entries.insert(rel.clone(), desired);
+                // Record the bytes that actually landed — the source may have
+                // changed between the plan and the write.
+                entries.insert(rel.clone(), fingerprint(&dest));
             }
             Act::Remove(rel) => {
                 if remove_entry(&dest)? {
@@ -2501,40 +2530,57 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                         }
                     }
                 }
-                Some(entry) if entry.mode == "120000" => {
-                    remove_entry(&dest)?;
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| anyhow!("could not create {}: {}", parent.display(), e))?;
+                // A submodule pin has no content to land.
+                Some(entry) if entry.mode == "160000" => {}
+                Some(entry) if entry.mode.starts_with("04") => {
+                    let children = tree_entries(target, base, rel)?;
+                    if fingerprint(&dest) != "dir" {
+                        remove_entry(&dest)?;
+                    } else {
+                        // Inside a kept directory, drop only the leftovers this
+                        // source synced and the base lacks — unrelated files
+                        // stay put.
+                        let keep: std::collections::HashSet<&str> =
+                            children.iter().map(String::as_str).collect();
+                        for f in files_inside(&dest, target) {
+                            if f.starts_with(&format!("{rel}/")) && !keep.contains(f.as_str()) {
+                                let fdest = safe_target_path(target, &f)?;
+                                if entries.get(&f).is_some_and(|fp| fp == &fingerprint(&fdest)) {
+                                    remove_entry(&fdest)?;
+                                }
+                            }
+                        }
                     }
-                    create_symlink(Path::new(&entry.text()), &dest)?;
-                    outcome.copied += 1;
+                    git_bytes(
+                        target,
+                        &["restore", "--worktree", "--source", base, "--", rel],
+                        &[],
+                    )?;
+                    outcome.copied += children.len();
                 }
-                Some(entry) => {
+                Some(_) => {
+                    // `git restore --worktree` lands the base's file or link
+                    // with its own mode and content filters, never the index.
                     remove_entry(&dest)?;
-                    if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| anyhow!("could not create {}: {}", parent.display(), e))?;
-                    }
-                    std::fs::write(&dest, &entry.bytes)
-                        .map_err(|e| anyhow!("could not write {}: {}", dest.display(), e))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
-                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))
-                            .map_err(|e| anyhow!("could not chmod {}: {}", dest.display(), e))?;
-                    }
+                    git_bytes(
+                        target,
+                        &["restore", "--worktree", "--source", base, "--", rel],
+                        &[],
+                    )?;
                     outcome.copied += 1;
                 }
             },
         }
         if matches!(act, Act::Revert(_)) {
-            entries.remove(&rel);
+            // Back at the base state: nothing this source owns anymore.
+            let prefix = format!("{rel}/");
+            entries.retain(|k, _| k.as_str() != rel && !k.starts_with(prefix.as_str()));
         }
+        // Persist after every applied act so an interrupted sync still knows
+        // what it already wrote.
+        manifest.sources.insert(source_key.clone(), entries.clone());
+        manifest.write(&manifest_path)?;
     }
-    manifest.sources.insert(source_key, entries);
-    manifest.write(&manifest_path)?;
     Ok(outcome)
 }
 
@@ -2647,7 +2693,19 @@ fn base_entry(repo: &Path, base: &str, rel: &str) -> Result<Option<BaseEntry>> {
             bytes: Vec::new(),
         }));
     }
-    let bytes = git_bytes(repo, &["cat-file", "blob", &sha], &[])?;
+    // Smudge the blob the way a checkout would (eol, attributes, filters) so
+    // the fingerprint matches the on-disk bytes: raw `cat-file` bytes compare
+    // false against a CRLF-converted checkout. Symlink blobs are the literal
+    // link target and must not be converted.
+    let bytes = if mode == "120000" {
+        git_bytes(repo, &["cat-file", "blob", &sha], &[])?
+    } else {
+        git_bytes(
+            repo,
+            &["cat-file", "--filters", &format!("{base}:{rel}")],
+            &[],
+        )?
+    };
     Ok(Some(BaseEntry { mode, bytes }))
 }
 
@@ -2711,7 +2769,17 @@ fn remove_entry(path: &Path) -> Result<bool> {
         Ok(m) => m,
         Err(_) => return Ok(false),
     };
-    if meta.is_dir() && !meta.file_type().is_symlink() {
+    #[cfg(windows)]
+    let dir_link = {
+        use std::os::windows::fs::FileTypeExt;
+        meta.file_type().is_symlink_dir()
+    };
+    #[cfg(not(windows))]
+    let dir_link = false;
+    if dir_link {
+        // Windows removes a directory link with remove_dir, never remove_file.
+        std::fs::remove_dir(path)
+    } else if meta.is_dir() && !meta.file_type().is_symlink() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
@@ -2734,16 +2802,56 @@ fn prune_empty_dirs(mut dir: &Path, stop: &Path) {
     }
 }
 
-#[cfg(unix)]
-fn create_symlink(link: &Path, dest: &Path) -> Result<()> {
-    std::os::unix::fs::symlink(link, dest)
-        .map_err(|e| anyhow!("could not link {}: {}", dest.display(), e))
+/// Every repo-relative file path inside the base's tree at `rel` — what
+/// `git restore` will write when a reverted directory comes back.
+fn tree_entries(repo: &Path, base: &str, rel: &str) -> Result<Vec<String>> {
+    let out = git_bytes(
+        repo,
+        &["ls-tree", "-r", "-z", "--name-only", base, "--", rel],
+        &[],
+    )?;
+    Ok(split_nul(&out))
 }
 
-#[cfg(windows)]
-fn create_symlink(link: &Path, dest: &Path) -> Result<()> {
-    std::os::windows::fs::symlink_file(link, dest)
-        .map_err(|e| anyhow!("could not link {}: {}", dest.display(), e))
+/// Safety for restoring a base directory at `rel`: the path itself may only
+/// be absent, a directory, or this source's own synced entry, and every path
+/// the restore writes — plus every ancestor it passes — must likewise be free
+/// of unrecorded edits. Files already inside the directory that the base
+/// doesn't know are left alone.
+fn revert_tree_ok(
+    entries: &std::collections::BTreeMap<String, String>,
+    target: &Path,
+    base: &str,
+    rel: &str,
+    current: &str,
+) -> Result<bool> {
+    if !(current.is_empty() || current == "dir" || entries.get(rel) == Some(&current.into())) {
+        return Ok(false);
+    }
+    let rel_depth = rel.matches('/').count() + 1;
+    for child in tree_entries(target, base, rel)? {
+        let parts: Vec<&str> = child.split('/').collect();
+        for i in rel_depth..parts.len().saturating_sub(1) {
+            let prefix = parts[..=i].join("/");
+            let pcur = fingerprint(&safe_target_path(target, &prefix)?);
+            if !(pcur.is_empty() || pcur == "dir" || entries.get(&prefix) == Some(&pcur)) {
+                return Ok(false);
+            }
+        }
+        let cdest = safe_target_path(target, &child)?;
+        let ccur = fingerprint(&cdest);
+        if ccur.is_empty() || ccur == "dir" || entries.get(&child).is_some_and(|fp| fp == &ccur) {
+            continue;
+        }
+        if ccur
+            != base_entry(target, base, &child)?
+                .map(|e| e.fingerprint())
+                .unwrap_or_default()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Last-synced fingerprints per source checkout, persisted as
@@ -2763,9 +2871,19 @@ impl SyncManifest {
             .unwrap_or_default()
     }
 
+    /// Atomic replace through a temp file so an interrupted save can't leave
+    /// a torn manifest behind. Windows won't rename over an existing file, so
+    /// the target is dropped first there — the manifest is small.
     fn write(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_vec(self)?)
-            .map_err(|e| anyhow!("could not write {}: {}", path.display(), e))
+        let tmp = path.with_file_name("orx-sync.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self)?)
+            .map_err(|e| anyhow!("could not write {}: {}", tmp.display(), e))?;
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path)
+                .map_err(|e| anyhow!("could not write {}: {}", path.display(), e))?;
+        }
+        Ok(())
     }
 }
 
@@ -3370,6 +3488,75 @@ mod tests {
         // The conflict is recorded: the hub-side edit survives the next syncs
         // until the user resolves it, while other paths keep syncing.
         let _ = std::fs::remove_file(hub.join("committed.txt"));
+
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_worktree_changes_handles_converted_files_and_directories() {
+        let hub = temp_repo();
+        write(&hub, ".gitattributes", "crlf.txt text eol=crlf\n");
+        write(&hub, "dir/a.txt", "in dir\n");
+        write(&hub, "crlf.txt", "a\r\n"); // stored as LF, checked out as CRLF
+        run(&hub, &["add", "-A"]);
+        run(&hub, &["commit", "-q", "-m", "seed"]);
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_file_name(format!("{}-wt", hub.file_name().unwrap().to_string_lossy()));
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+
+        // A worktree edit to a checkout-converted file still syncs: the hub's
+        // copy compares equal to the base's smudged bytes, not a conflict.
+        write(&wt, "crlf.txt", "b\r\n");
+        let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(outcome.copied, 1);
+        assert!(outcome.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("crlf.txt")).unwrap(),
+            "b\r\n"
+        );
+
+        // The worktree replacing a directory with a file conflicts while the
+        // hub's directory still holds an unrelated file.
+        run(&wt, &["rm", "-r", "-q", "dir"]);
+        write(&wt, "dir", "as file\n");
+        run(&wt, &["add", "dir"]);
+        write(&hub, "dir/extra.txt", "unrelated\n");
+        let blocked = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(blocked.conflicts, vec!["dir".to_string()]);
+        assert!(hub.join("dir/a.txt").is_file());
+        assert!(hub.join("dir/extra.txt").is_file());
+
+        // Once only removable content remains, the file lands.
+        std::fs::remove_file(hub.join("dir/extra.txt")).unwrap();
+        let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert!(outcome.conflicts.is_empty());
+        assert!(hub.join("dir").is_file());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir")).unwrap(),
+            "as file\n"
+        );
+
+        // The worktree reverting to the base restores the directory — it does
+        // not leave an empty file behind.
+        run(&wt, &["reset", "-q", "--hard", &base]);
+        let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert!(outcome.conflicts.is_empty());
+        assert!(hub.join("dir").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir/a.txt")).unwrap(),
+            "in dir\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("crlf.txt")).unwrap(),
+            "a\r\n"
+        );
 
         run(
             &hub,
