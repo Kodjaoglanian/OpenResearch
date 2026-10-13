@@ -30,11 +30,14 @@ import { ltr } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   fmtNumber,
+  getSessionStorage,
   githubBranchUrl,
   manageProjectFile,
   revealFileInManager,
+  revealSessionStorage,
   syncSessionWorktree,
   type Project,
+  type SessionStoragePaths,
 } from "../api";
 
 import { CodeBrowserHeader, type CodeBrowserView } from "./CodeBrowserHeader";
@@ -147,6 +150,12 @@ export function WorktreeTab({
     copyFilePath(root, path);
   };
   const [syncing, setSyncing] = useState(false);
+  const [showStorage, setShowStorage] = useState(false);
+  const storage = useQuery({
+    queryKey: workspaceKey("getSessionStorage", sessionId ?? ""),
+    queryFn: ({ signal }) => getSessionStorage(sessionId ?? "", signal),
+    enabled: Boolean(sessionId) && showStorage,
+  });
   /** Overlay this worktree's changes into the project folder — the explicit
    * "land my work in the folder I picked" action. */
   const sync = async () => {
@@ -174,6 +183,14 @@ export function WorktreeTab({
     if (!sessionId) return;
     try {
       await revealFileInManager(projectId, ".", { sessionId });
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : String(error), "error");
+    }
+  };
+  const revealStorage = async (location: keyof SessionStoragePaths) => {
+    if (!sessionId) return;
+    try {
+      await revealSessionStorage(sessionId, location);
     } catch (error) {
       showAlert(error instanceof Error ? error.message : String(error), "error");
     }
@@ -218,6 +235,39 @@ export function WorktreeTab({
         refreshing={loading}
         onRefresh={load}
       />
+      {sessionId && (
+        <details
+          className="shrink-0 border-b border-border-variant px-3 py-2 text-sm"
+          onToggle={(event) => setShowStorage(event.currentTarget.open)}
+        >
+          <summary className="cursor-pointer text-subtext">{m.worktree_storage_locations()}</summary>
+          <p className="my-2 text-muted">{m.worktree_storage_note()}</p>
+          {storage.error && <p className="text-muted">{m.common_failed_to_load({ error: ltr(storage.error.message) })}</p>}
+          {!storage.data && !storage.error && <Spinner />}
+          {storage.data && ([
+            ["records", m.worktree_storage_records()],
+            ["transcript", m.worktree_storage_transcript()],
+            ["attachments", m.worktree_storage_attachments()],
+            ["artifacts", m.worktree_storage_artifacts()],
+          ] as const).map(([location, label]) => (
+            <div key={location} className="flex items-center gap-2 py-1">
+              <div className="min-w-0 flex-1">
+                <div>{label}</div>
+                <code dir="ltr" className="block wrap-anywhere text-xs text-muted">{storage.data[location]}</code>
+              </div>
+              <IconButton
+                size="small"
+                aria-label={`${m.file_viewer_reveal_in_file_manager()}: ${label}`}
+                data-tip={remote ? m.file_viewer_os_action_local_only() : m.file_viewer_reveal_in_file_manager()}
+                disabled={remote}
+                onClick={() => void revealStorage(location)}
+              >
+                <FolderOpen size={13} />
+              </IconButton>
+            </div>
+          ))}
+        </details>
+      )}
       {error && (wt || tree) && <CodeTabNote>{m.worktree_tab_refresh_failed()} {ltr(error)}</CodeTabNote>}
       {!tree || (sessionId && !wt) ? (
         <CodeTabBody>

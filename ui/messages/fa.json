@@ -1,4 +1,10 @@
 {
+  "worktree_storage_locations": "محل‌های ذخیره‌سازی",
+  "worktree_storage_note": "این سوابق داخلی می‌مانند. همگام‌سازی فقط تغییرات درخت کاری را کپی می‌کند؛ پیام‌های گفتگو در orx.db نیز ذخیره می‌شوند.",
+  "worktree_storage_records": "گزارش‌های عامل و داده‌های OpenResearch",
+  "worktree_storage_transcript": "رونوشت جلسه / پایگاه داده",
+  "worktree_storage_attachments": "پیوست‌های گفتگو (پوشه مشترک)",
+  "worktree_storage_artifacts": "خروجی‌های پروژه",
   "workspace_active_experiments": "آزمایش‌های فعال",
   "files_empty_description": "فایل‌های این فضای کاری اینجا نمایش داده می‌شوند. برای شروع، از عامل بخواهید فایلی ایجاد کند.",
   "experiments_empty_description": "آزمایش‌ها و اجراهای آن‌ها اینجا نمایش داده می‌شوند. برای شروع، از عامل بخواهید آزمایشی راه‌اندازی کند.",

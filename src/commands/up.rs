@@ -765,6 +765,11 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
+        .route("/api/chat/sessions/{id}/storage", get(session_storage))
+        .route(
+            "/api/chat/sessions/{id}/storage/reveal",
+            post(reveal_session_storage),
+        )
         .route(
             "/api/chat/sessions/{id}/worktree/sync",
             post(sync_session_worktree),
@@ -2797,6 +2802,94 @@ async fn session_worktree(Path(id): Path<String>) -> ApiResult {
             "files": files,
             "diff": diff_json(payload),
         })))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SessionStorageLocation {
+    Records,
+    Transcript,
+    Attachments,
+    Artifacts,
+}
+
+fn session_storage_path(
+    project: &local::model::LocalProject,
+    session: &StoredChatSession,
+    location: SessionStorageLocation,
+) -> Result<std::path::PathBuf> {
+    Ok(match location {
+        SessionStorageLocation::Records => crate::store::data_dir(),
+        SessionStorageLocation::Transcript => {
+            let native = match (
+                session.harness.as_str(),
+                session.native_session_id.as_deref(),
+            ) {
+                ("claude-code", Some(id)) => local::native_store::claude_session(id)?,
+                ("codex", Some(id)) => local::native_store::codex_session(id)?,
+                ("opencode", Some(id)) => local::native_store::opencode_session(id)?,
+                ("cursor", Some(id)) => local::native_store::cursor_session(id)?,
+                _ => None,
+            };
+            native
+                .map(|location| location.path)
+                .unwrap_or_else(|| crate::store::data_dir().join("orx.db"))
+        }
+        SessionStorageLocation::Attachments => crate::store::data_dir().join("chat-attachments"),
+        SessionStorageLocation::Artifacts => local::files::files_dir(project),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevealSessionStorageReq {
+    location: SessionStorageLocation,
+}
+
+async fn session_storage(Path(id): Path<String>) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        Ok(Json(json!({
+            "records": session_storage_path(&project, &session, SessionStorageLocation::Records)?,
+            "transcript": session_storage_path(&project, &session, SessionStorageLocation::Transcript)?,
+            "attachments": session_storage_path(&project, &session, SessionStorageLocation::Attachments)?,
+            "artifacts": session_storage_path(&project, &session, SessionStorageLocation::Artifacts)?,
+        })))
+    })
+    .await
+}
+
+async fn reveal_session_storage(
+    Path(id): Path<String>,
+    Json(req): Json<RevealSessionStorageReq>,
+) -> ApiResult {
+    blocking_api(move || {
+        let store = Store::open()?;
+        let session = store
+            .get_chat_session(&id)?
+            .ok_or_else(|| not_found("chat session"))?;
+        let project = store
+            .get_local_project(&session.project_id)?
+            .ok_or_else(|| not_found("project"))?;
+        let create_folder = matches!(
+            req.location,
+            SessionStorageLocation::Attachments | SessionStorageLocation::Artifacts
+        );
+        let path = session_storage_path(&project, &session, req.location)?;
+        if create_folder {
+            std::fs::create_dir_all(&path).map_err(crate::error::Error::from)?;
+        }
+        crate::editors::reveal_in_file_manager(&path)
+            .map_err(|e| ApiError::from(anyhow!("could not reveal folder: {e}")))?;
+        Ok(Json(json!({ "ok": true })))
     })
     .await
 }
@@ -8489,6 +8582,23 @@ pub(crate) async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_reveal_accepts_only_known_locations() {
+        for location in ["records", "transcript", "attachments", "artifacts"] {
+            assert!(serde_json::from_value::<RevealSessionStorageReq>(
+                json!({ "location": location })
+            )
+            .is_ok());
+        }
+        for request in [
+            json!({ "location": "../secrets" }),
+            json!({ "location": "artifacts", "path": "/etc" }),
+            json!({ "path": "/etc" }),
+        ] {
+            assert!(serde_json::from_value::<RevealSessionStorageReq>(request).is_err());
+        }
+    }
 
     #[test]
     fn new_chat_uses_saved_preferences_and_normalizes_model_settings() {

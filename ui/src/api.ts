@@ -817,6 +817,16 @@ export const syncSessionWorktree = (sessionId: string) =>
     `/api/chat/sessions/${sessionId}/worktree/sync`,
   );
 
+export type SessionStoragePaths = Record<"records" | "transcript" | "attachments" | "artifacts", string>;
+
+export const getSessionStorage = (sessionId: string, signal?: AbortSignal) =>
+  get<SessionStoragePaths>(`/api/chat/sessions/${sessionId}/storage`, signal);
+
+export const revealSessionStorage = (
+  sessionId: string,
+  location: keyof SessionStoragePaths,
+) => post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/storage/reveal`, { location });
+
 /** A GitHub `tree` URL for a branch. Branch names contain `/` (`orx/<slug>`),
  * so encode each path segment — never the whole string, which would escape the
  * slashes. Unpushed branches 404 on GitHub, which is acceptable. */

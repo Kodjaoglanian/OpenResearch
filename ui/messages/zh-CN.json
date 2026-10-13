@@ -1,4 +1,10 @@
 {
+  "worktree_storage_locations": "存储位置",
+  "worktree_storage_note": "这些记录仍保存在内部。同步仅复制工作树更改；聊天消息也存储在 orx.db 中。",
+  "worktree_storage_records": "代理日志和 OpenResearch 数据",
+  "worktree_storage_transcript": "会话记录 / 数据库",
+  "worktree_storage_attachments": "聊天附件（共享文件夹）",
+  "worktree_storage_artifacts": "项目产物",
   "workspace_active_experiments": "活跃实验",
   "files_empty_description": "此工作区中的文件会显示在这里。让智能体创建一个文件即可开始。",
   "experiments_empty_description": "实验及其运行会显示在这里。让智能体设置一个实验即可开始。",

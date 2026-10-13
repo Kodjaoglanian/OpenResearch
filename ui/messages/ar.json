@@ -1,4 +1,10 @@
 {
+  "worktree_storage_locations": "مواقع التخزين",
+  "worktree_storage_note": "تبقى هذه السجلات داخلية. تنسخ المزامنة تغييرات شجرة العمل فقط؛ وتُخزّن رسائل المحادثة أيضًا في orx.db.",
+  "worktree_storage_records": "سجلات الوكيل وبيانات OpenResearch",
+  "worktree_storage_transcript": "سجل الجلسة / قاعدة البيانات",
+  "worktree_storage_attachments": "مرفقات المحادثة (مجلد مشترك)",
+  "worktree_storage_artifacts": "مخرجات المشروع",
   "workspace_active_experiments": "التجارب النشطة",
   "files_empty_description": "ستظهر ملفات مساحة العمل هنا. اطلب من الوكيل إنشاء ملف للبدء.",
   "experiments_empty_description": "ستظهر التجارب وعمليات تشغيلها هنا. اطلب من الوكيل إعداد تجربة للبدء.",

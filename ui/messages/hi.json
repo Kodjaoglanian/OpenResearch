@@ -1,4 +1,10 @@
 {
+  "worktree_storage_locations": "स्टोरेज स्थान",
+  "worktree_storage_note": "ये रिकॉर्ड आंतरिक रहते हैं। सिंक केवल वर्कट्री के बदलाव कॉपी करता है; चैट संदेश orx.db में भी संग्रहीत होते हैं।",
+  "worktree_storage_records": "एजेंट लॉग और OpenResearch डेटा",
+  "worktree_storage_transcript": "सत्र ट्रांसक्रिप्ट / डेटाबेस",
+  "worktree_storage_attachments": "चैट अटैचमेंट (साझा फ़ोल्डर)",
+  "worktree_storage_artifacts": "प्रोजेक्ट आर्टिफैक्ट",
   "workspace_active_experiments": "सक्रिय प्रयोग",
   "files_empty_description": "इस वर्कस्पेस की फ़ाइलें यहाँ दिखेंगी। शुरू करने के लिए एजेंट से एक फ़ाइल बनाने को कहें।",
   "experiments_empty_description": "प्रयोग और उनके रन यहाँ दिखेंगे। शुरू करने के लिए एजेंट से एक प्रयोग सेट अप करने को कहें।",

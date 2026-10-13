@@ -1,4 +1,10 @@
 {
+  "worktree_storage_locations": "保存場所",
+  "worktree_storage_note": "これらの記録は内部に残ります。同期では作業ツリーの変更のみをコピーします。チャットメッセージは orx.db にも保存されます。",
+  "worktree_storage_records": "エージェントログと OpenResearch データ",
+  "worktree_storage_transcript": "セッションの記録 / データベース",
+  "worktree_storage_attachments": "チャット添付ファイル（共有フォルダー）",
+  "worktree_storage_artifacts": "プロジェクト成果物",
   "workspace_active_experiments": "進行中の実験",
   "files_empty_description": "このワークスペースのファイルがここに表示されます。エージェントにファイルの作成を依頼して始めましょう。",
   "experiments_empty_description": "実験と実行履歴がここに表示されます。エージェントに実験の設定を依頼して始めましょう。",

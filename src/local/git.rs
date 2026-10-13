@@ -2556,7 +2556,15 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                     }
                     git_bytes(
                         target,
-                        &["restore", "--worktree", "--source", base, "--", rel],
+                        &[
+                            "--literal-pathspecs",
+                            "restore",
+                            "--worktree",
+                            "--source",
+                            base,
+                            "--",
+                            rel,
+                        ],
                         &[],
                     )?;
                     outcome.copied += children.len();
@@ -2567,7 +2575,15 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                     remove_entry(&dest)?;
                     git_bytes(
                         target,
-                        &["restore", "--worktree", "--source", base, "--", rel],
+                        &[
+                            "--literal-pathspecs",
+                            "restore",
+                            "--worktree",
+                            "--source",
+                            base,
+                            "--",
+                            rel,
+                        ],
                         &[],
                     )?;
                     outcome.copied += 1;
@@ -2677,7 +2693,11 @@ impl BaseEntry {
 }
 
 fn base_entry(repo: &Path, base: &str, rel: &str) -> Result<Option<BaseEntry>> {
-    let out = git_bytes(repo, &["ls-tree", "-z", base, "--", rel], &[])?;
+    let out = git_bytes(
+        repo,
+        &["--literal-pathspecs", "ls-tree", "-z", base, "--", rel],
+        &[],
+    )?;
     let record = out.split(|b| *b == 0).next().unwrap_or(&[]);
     if record.is_empty() {
         return Ok(None);
@@ -2810,7 +2830,16 @@ fn prune_empty_dirs(mut dir: &Path, stop: &Path) {
 fn tree_entries(repo: &Path, base: &str, rel: &str) -> Result<Vec<String>> {
     let out = git_bytes(
         repo,
-        &["ls-tree", "-r", "-z", "--name-only", base, "--", rel],
+        &[
+            "--literal-pathspecs",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            base,
+            "--",
+            rel,
+        ],
         &[],
     )?;
     Ok(split_nul(&out))
@@ -3543,6 +3572,55 @@ mod tests {
         // until the user resolves it, while other paths keep syncing.
         let _ = std::fs::remove_file(hub.join("committed.txt"));
 
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_restores_literal_names_without_overwriting_pattern_matches() {
+        let hub = temp_repo();
+        write(&hub, "fig[1].txt", "base\n");
+        write(&hub, "fig1.txt", "other\n");
+        write(&hub, "dir[1]/data.txt", "base directory\n");
+        write(&hub, "dir1/data.txt", "other directory\n");
+        run(&hub, &["add", "-A"]);
+        run(&hub, &["commit", "-q", "-m", "seed literal names"]);
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_file_name(format!("{}-wt", hub.file_name().unwrap().to_string_lossy()));
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        write(&wt, "fig[1].txt", "agent edit\n");
+        std::fs::remove_dir_all(wt.join("dir[1]")).unwrap();
+        write(&wt, "dir[1]", "agent replacement\n");
+        run(&wt, &["add", "-A"]);
+        let copied = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert!(copied.conflicts.is_empty());
+        write(&hub, "fig1.txt", "user edit\n");
+        write(&hub, "dir1/data.txt", "user directory edit\n");
+        run(&wt, &["reset", "-q", "--hard", &base]);
+        let restored = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert!(restored.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("fig[1].txt")).unwrap(),
+            "base\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("fig1.txt")).unwrap(),
+            "user edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir[1]/data.txt")).unwrap(),
+            "base directory\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir1/data.txt")).unwrap(),
+            "user directory edit\n"
+        );
         run(
             &hub,
             &["worktree", "remove", "--force", &wt.to_string_lossy()],

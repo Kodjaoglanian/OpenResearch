@@ -1,4 +1,10 @@
 {
+  "worktree_storage_locations": "Lokalizacje zapisu",
+  "worktree_storage_note": "Te dane pozostają wewnętrzne. Synchronizacja kopiuje tylko zmiany drzewa roboczego; wiadomości są też zapisane w orx.db.",
+  "worktree_storage_records": "Logi agenta i dane OpenResearch",
+  "worktree_storage_transcript": "Transkrypcja sesji / baza danych",
+  "worktree_storage_attachments": "Załączniki czatu (wspólny folder)",
+  "worktree_storage_artifacts": "Artefakty projektu",
   "$schema": "https://inlang.com/schema/inlang-message-format",
   "workspace_active_experiments": "Aktywne eksperymenty",
   "files_empty_description": "Tutaj pojawią się pliki obszaru roboczego. Poproś agenta o utworzenie pliku, aby rozpocząć.",
