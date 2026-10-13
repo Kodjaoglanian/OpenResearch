@@ -51,7 +51,10 @@ impl LocalPlane {
             .map(|e| (e.id.clone(), e.display_name().to_string()))
             .collect();
 
-        let runs = store.list_runs_by_project(project_id)?;
+        let mut runs = Vec::new();
+        for run in store.list_runs_by_project(project_id)? {
+            runs.push(crate::commands::supervise::refresh_local_run(run).await?);
+        }
         let runs: Vec<Run> = runs.iter().map(Run::from).collect();
         Ok(RunListing { runs, titles })
     }
@@ -166,6 +169,7 @@ impl LocalPlane {
 
         match store.latest_run_for_experiment(&exp.id)? {
             Some(r) => {
+                let r = crate::commands::supervise::refresh_local_run(r).await?;
                 let run = Run::from(&r);
                 let commit = run
                     .commit_sha
