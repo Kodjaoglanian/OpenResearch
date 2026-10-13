@@ -294,7 +294,8 @@ pub fn stream_logs(
     Ok(seen)
 }
 
-/// TERM the process group (pid == pgid), else the pid alone; on Windows, the process tree.
+/// TERM the process group, escalate to KILL after five seconds, and wait for it to stop.
+/// On Windows, terminate the process tree.
 pub fn cancel_job(dir: &Path) -> Result<()> {
     let pid = std::fs::read_to_string(dir.join("pid"))
         .map_err(|e| anyhow!("Could not read the run's pid: {}", e))?;
@@ -353,7 +354,63 @@ fn terminate_group(pid: &str) -> Result<()> {
             return Err(anyhow!("Could not terminate local process group {pid}"));
         }
     }
-    Ok(())
+    let target = if group { format!("-{pid}") } else { pid.into() };
+    let alive = || {
+        if group {
+            group_alive(pid)
+        } else {
+            pid_alive(pid)
+        }
+    };
+    for attempts in [50, 10] {
+        for _ in 0..attempts {
+            if !alive() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !alive() {
+            return Ok(());
+        }
+        if attempts == 50 {
+            let status = std::process::Command::new("kill")
+                .args(["-KILL", "--", &target])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()?;
+            if !status.success() && alive() {
+                return Err(anyhow!("Could not kill local process group {pid}"));
+            }
+        }
+    }
+    Err(anyhow!("Local process group {pid} is still alive"))
+}
+
+#[cfg(not(windows))]
+fn group_alive(pid: &str) -> bool {
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-e", "-o", "pgid=,stat="])
+        .stderr(std::process::Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            // The launcher can exit first; zombies cannot retain GPU allocations.
+            return String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                let mut fields = line.split_whitespace();
+                fields.next() == Some(pid)
+                    && fields
+                        .next()
+                        .is_some_and(|stat| !stat.starts_with(['Z', 'X']))
+            });
+        }
+    }
+    let Ok(pid) = pid.parse::<libc::pid_t>() else {
+        return false;
+    };
+    // SAFETY: a positive recorded PID targets only that group; signal 0 checks existence.
+    pid > 0
+        && (unsafe { libc::kill(-pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 /// What "this machine" is, for the Compute settings card: the hardware a
@@ -651,6 +708,58 @@ mod tests {
                 heartbeat,
                 "rollback must terminate descendants after the payload finishes"
             );
+        }
+
+        #[cfg(unix)]
+        {
+            let resistant = run_job(&LocalJobSpec {
+                run_id: "term-resistant".into(),
+                script: "(trap '' TERM; echo $BASHPID > worker-pid; while :; do echo tick >> heartbeat; sleep 0.1; done) & wait".into(),
+                env: HashMap::new(),
+                secret_env: HashMap::new(),
+            })
+            .unwrap();
+            for _ in 0..100 {
+                if resistant.join("heartbeat").exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let started = resistant.join("heartbeat").exists();
+            let group = std::fs::read_to_string(resistant.join("pid")).unwrap();
+            let mut unrelated = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            let start = std::time::Instant::now();
+            let cancelled = cancel_job(&resistant);
+            let elapsed = start.elapsed();
+            let survivors = group_alive(group.trim());
+            let worker = std::fs::read_to_string(resistant.join("worker-pid")).unwrap();
+            let worker_state = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", worker.trim()])
+                .output()
+                .unwrap();
+            let worker_state = String::from_utf8_lossy(&worker_state.stdout);
+            let unrelated_alive = unrelated.try_wait().unwrap().is_none();
+            // Clean up even when testing the pre-fix implementation.
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", group.trim())])
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = unrelated.kill();
+            unrelated.wait().unwrap();
+            assert!(started, "the TERM-resistant worker did not start");
+            cancelled.unwrap();
+            assert!(elapsed >= std::time::Duration::from_secs(5));
+            assert!(
+                !survivors,
+                "cancel returned while the group still had live workers"
+            );
+            assert!(worker_state.trim().is_empty() || worker_state.trim().starts_with('Z'));
+            assert!(unrelated_alive, "cancellation killed an unrelated process");
+            assert_eq!(wait_terminal(&resistant).stage, "ERROR");
+            assert_reaped(&resistant);
         }
 
         #[cfg(unix)]
