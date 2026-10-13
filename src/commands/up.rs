@@ -5382,15 +5382,14 @@ async fn set_dashboard_locale(Json(SetLocaleReq { locale }): Json<SetLocaleReq>)
     if !valid {
         return Err(bad_request(format!("invalid locale: {locale:?}")));
     }
-    let response = tokio::task::spawn_blocking(move || -> ApiResult {
+    tokio::task::spawn_blocking(move || {
         crate::telemetry::set_dashboard_locale(&locale)
             .map_err(|e| ApiError::from(anyhow!("could not save the dashboard locale: {e}")))?;
+        crate::telemetry::capture("dashboard_locale", json!({}));
         Ok(Json(json!({ "locale": locale })))
     })
     .await
-    .map_err(|e| ApiError::from(anyhow!("locale task failed: {e}")))??;
-    crate::telemetry::capture("dashboard_locale", json!({}));
-    Ok(response)
+    .map_err(|e| ApiError::from(anyhow!("locale task failed: {e}")))?
 }
 
 // --- updates -----------------------------------------------------------------

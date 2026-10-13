@@ -2168,12 +2168,12 @@ mod tests {
                 ),
             ]
         });
-        let mut localized = build_payload("app_started", "cli-release-contract-test", json!({}));
-        localized["context"]["locale"] = json!("zh-CN");
-        for payload in payloads.into_iter().chain(launch_payloads).chain([
-            localized,
-            build_payload("dashboard_locale", "cli-release-contract-test", json!({})),
-        ]) {
+        let localized = ["app_started", "dashboard_locale"].map(|event| {
+            let mut payload = build_payload(event, "cli-release-contract-test", json!({}));
+            payload["context"]["locale"] = json!("zh-CN");
+            payload
+        });
+        for payload in payloads.into_iter().chain(launch_payloads).chain(localized) {
             assert_eq!(post_payload(&payload).await, DeliveryOutcome::Acknowledged);
         }
     }
