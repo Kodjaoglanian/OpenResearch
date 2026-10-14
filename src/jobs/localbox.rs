@@ -164,12 +164,17 @@ fn run_alive_via(ps: &str, dir: &Path, pid: &str) -> bool {
         return false;
     }
     match std::fs::read_to_string(dir.join("pid_script")) {
-        Ok(script) => command
-            .strip_suffix(&script)
-            .is_some_and(|prefix| prefix.ends_with(' ')),
+        Ok(script) => command_runs_script(command, &script),
         // Runs launched before pid_script existed still use their original PID contract.
         Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
+}
+
+#[cfg(not(windows))]
+fn command_runs_script(command: &str, script: &str) -> bool {
+    command
+        .strip_suffix(script)
+        .is_some_and(|prefix| prefix.ends_with(' '))
 }
 
 /// EPERM still means the process exists, just not one we may signal.
@@ -461,7 +466,12 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
     #[cfg(not(target_os = "linux"))]
     {
         let output = std::process::Command::new("ps")
-            .args(["-wwE", "-e", "-o", "pid=,pgid=,stat=,command="])
+            .args([
+                if token.is_some() { "-wwE" } else { "-ww" },
+                "-e",
+                "-o",
+                "pid=,pgid=,stat=,command=",
+            ])
             .output()?;
         if !output.status.success() {
             return Err(anyhow!("Could not inspect local process group {pid}"));
@@ -479,7 +489,10 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
             alive = true;
             leader_live |= member_pid == Some(pid);
             owned |= fields.any(|field| token.as_deref() == Some(field))
-                || (token.is_none() && script.as_ref().is_some_and(|script| line.contains(script)));
+                || (token.is_none()
+                    && script
+                        .as_ref()
+                        .is_some_and(|script| command_runs_script(line.trim_end(), script)));
         }
     }
     if alive && !owned {
@@ -638,6 +651,25 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("local run {} was not reaped", pid.trim());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn script_identity_preserves_spaces_but_rejects_longer_paths() {
+        let script = "/tmp/run directory/run.sh";
+        assert!(command_runs_script(&format!("bash {script}"), script));
+        assert!(!command_runs_script(
+            &format!("bash {script}.backup"),
+            script
+        ));
+        assert!(!command_runs_script(
+            &format!("bash /prefix{script}"),
+            script
+        ));
+        assert!(!command_runs_script(
+            &format!("bash {script} other"),
+            script
+        ));
     }
 
     #[cfg(not(windows))]
