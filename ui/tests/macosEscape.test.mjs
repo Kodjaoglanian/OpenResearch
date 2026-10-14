@@ -12,8 +12,18 @@ test("the Escape guard also reaches sandboxed preview frames", () => {
   assert.match(source, /\.with_initialization_script\("window\.__ORX_MAC_TITLEBAR__ = true;"\)/);
 });
 
-function dispatch(key, { modal = false, popover = false, handled = false, modalSupported = true, popoverSupported = true, search = false, readOnly = false, disabled = false } = {}) {
+function dispatch(key, { modal = false, cancelPrevented = false, popover = false, handled = false, modalSupported = true, popoverSupported = true, search = false, readOnly = false, disabled = false } = {}) {
   let listener;
+  const result = { hidden: false, cancelled: false, closed: false };
+  const dialog = {
+    dispatchEvent(event) {
+      assert.equal(event.type, "cancel");
+      assert.equal(event.cancelable, true);
+      result.cancelled = true;
+      return !cancelPrevented;
+    },
+    close() { result.closed = true; },
+  };
   runInNewContext(script, {
     window: {
       addEventListener(type, handler, capture = false) {
@@ -29,15 +39,18 @@ function dispatch(key, { modal = false, popover = false, handled = false, modalS
         return popoverSupported;
       },
     },
+    Event: class {
+      constructor(type, { cancelable }) { Object.assign(this, { type, cancelable }); }
+    },
     document: {
-      querySelector(selector) {
+      querySelectorAll(selector) {
         if (selector === "dialog:modal" || selector === "dialog[open]") {
           if (selector === "dialog:modal" && !modalSupported) throw new SyntaxError("unsupported :modal");
-          return modal ? {} : null;
+          return modal ? [{}, dialog] : [];
         }
         assert.equal(selector, "[popover]:popover-open:not([popover=manual])");
         if (!popoverSupported) throw new SyntaxError("unsupported :popover-open");
-        return popover && popover !== "manual" ? {} : null;
+        return popover && popover !== "manual" ? [{}, { hidePopover() { result.hidden = true; } }] : [];
       },
     },
   });
@@ -53,55 +66,58 @@ function dispatch(key, { modal = false, popover = false, handled = false, modalS
     preventDefault() { this.defaultPrevented = true; },
   };
   listener(event);
-  return event.defaultPrevented;
+  return { prevented: event.defaultPrevented, ...result };
 }
 
+const idle = { prevented: true, hidden: false, cancelled: false, closed: false };
+
 test("unhandled Escape cannot invoke WebKit's native fullscreen exit", () => {
-  assert.equal(dispatch("Escape"), true);
+  assert.deepEqual(dispatch("Escape"), idle);
 });
 
-test("chat and overlay Escape prevention remains intact", () => {
-  assert.equal(dispatch("Escape", { handled: true }), true);
+test("chat and overlay Escape handling is left alone", () => {
+  assert.deepEqual(dispatch("Escape", { handled: true, modal: true, popover: true }), idle);
 });
 
-test("native HTML modal dialogs keep their Escape cancel default", () => {
-  assert.equal(dispatch("Escape", { modal: true }), false);
+test("modal dialogs are cancelled without the native fallback", () => {
+  assert.deepEqual(dispatch("Escape", { modal: true }), { ...idle, cancelled: true, closed: true });
 });
 
-test("native HTML popovers keep their Escape dismiss default", () => {
-  assert.equal(dispatch("Escape", { popover: true }), false);
+test("dialogs that veto cancel stay open", () => {
+  assert.deepEqual(dispatch("Escape", { modal: true, cancelPrevented: true }), { ...idle, cancelled: true });
 });
 
-test("manual tooltips do not enable native fullscreen exit", () => {
-  assert.equal(dispatch("Escape", { popover: "manual" }), true);
+test("automatic popovers are dismissed before their dialog, without the native fallback", () => {
+  assert.deepEqual(dispatch("Escape", { popover: true, modal: true }), { ...idle, hidden: true });
+});
+
+test("manual tooltips are not dismissed and do not enable native fullscreen exit", () => {
+  assert.deepEqual(dispatch("Escape", { popover: "manual" }), idle);
 });
 
 test("other keyboard defaults remain intact", () => {
-  assert.equal(dispatch("Enter"), false);
-  assert.equal(dispatch("f"), false);
+  assert.equal(dispatch("Enter").prevented, false);
+  assert.equal(dispatch("f").prevented, false);
 });
 
-test("editable search fields keep WebKit's Escape-to-clear default", () => {
-  assert.equal(dispatch("Escape", { search: true }), false);
+test("editable search fields keep WebKit's handled Escape-to-clear default", () => {
+  assert.equal(dispatch("Escape", { search: true }).prevented, false);
 });
 
 test("immutable search fields cannot enable native fullscreen exit", () => {
-  assert.equal(dispatch("Escape", { search: true, readOnly: true }), true);
-  assert.equal(dispatch("Escape", { search: true, disabled: true }), true);
+  assert.deepEqual(dispatch("Escape", { search: true, readOnly: true }), idle);
+  assert.deepEqual(dispatch("Escape", { search: true, disabled: true }), idle);
 });
 
-test("older WebKit without popover selectors still prevents idle Escape", () => {
-  assert.equal(dispatch("Escape", { popoverSupported: false }), true);
+test("older WebKit without optional selectors still prevents idle Escape", () => {
+  assert.deepEqual(dispatch("Escape", { popoverSupported: false }), idle);
+  assert.deepEqual(dispatch("Escape", { modalSupported: false, popoverSupported: false }), idle);
 });
 
-test("older WebKit without either optional selector still prevents idle Escape", () => {
-  assert.equal(dispatch("Escape", { modalSupported: false, popoverSupported: false }), true);
+test("modal cancellation works when popover selectors are unavailable", () => {
+  assert.deepEqual(dispatch("Escape", { modal: true, popoverSupported: false }), { ...idle, cancelled: true, closed: true });
 });
 
-test("modal cancellation is preserved when popover selectors are unavailable", () => {
-  assert.equal(dispatch("Escape", { modal: true, popoverSupported: false }), false);
-});
-
-test("WebKit with native dialogs but no :modal keeps Escape-to-cancel", () => {
-  assert.equal(dispatch("Escape", { modal: true, modalSupported: false, popoverSupported: false }), false);
+test("WebKit with native dialogs but no :modal still cancels open dialogs", () => {
+  assert.deepEqual(dispatch("Escape", { modal: true, modalSupported: false, popoverSupported: false }), { ...idle, cancelled: true, closed: true });
 });
