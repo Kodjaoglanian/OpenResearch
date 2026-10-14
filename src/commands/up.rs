@@ -435,6 +435,7 @@ struct ProjectLifecycleState {
 struct ProjectAdmissionLease {
     inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
     project_id: String,
+    _shared: crate::store::LifecycleLock,
 }
 
 impl Drop for ProjectAdmissionLease {
@@ -452,6 +453,7 @@ impl Drop for ProjectAdmissionLease {
 struct ProjectDeletionLease {
     inner: Arc<std::sync::Mutex<ProjectLifecycleState>>,
     project_id: String,
+    _shared: crate::store::LifecycleLock,
 }
 
 impl Drop for ProjectDeletionLease {
@@ -466,10 +468,12 @@ impl ProjectLifecycle {
         if state.deleting.contains(project_id) {
             return None;
         }
+        let shared = crate::store::acquire_operation_lock("project", project_id, false).ok()?;
         *state.admissions.entry(project_id.to_string()).or_default() += 1;
         Some(ProjectAdmissionLease {
             inner: self.inner.clone(),
             project_id: project_id.to_string(),
+            _shared: shared,
         })
     }
 
@@ -491,10 +495,12 @@ impl ProjectLifecycle {
         {
             return None;
         }
+        let shared = crate::store::acquire_operation_lock("project", project_id, true).ok()?;
         state.deleting.insert(project_id.to_string());
         Some(ProjectDeletionLease {
             inner: self.inner.clone(),
             project_id: project_id.to_string(),
+            _shared: shared,
         })
     }
 
@@ -2032,9 +2038,9 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
     // Abort any in-flight chat turns before their rows disappear, and clean up
     // each session's serve child + worktree (the rows cascade with the project).
     let sessions = store.list_chat_sessions_by_project(&id)?;
-    let mut _session_deletions = Vec::with_capacity(sessions.len());
+    let mut session_deletions = Vec::with_capacity(sessions.len());
     for session in &sessions {
-        _session_deletions.push(
+        session_deletions.push(
             state
                 .chat
                 .begin_session_delete(&session.id)
@@ -2049,10 +2055,14 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         state.chat.claude.forget_session(&session.id).await;
     }
     store.delete_local_project(&id)?;
-    for session in &sessions {
-        local::chat::cleanup_session_transcript_artifacts(&session.id);
-        local::chat::cleanup_session_worktree(&project, &session.id);
-    }
+    tokio::task::spawn_blocking(move || {
+        let _deleting_project = _deleting_project;
+        let _session_deletions = session_deletions;
+        for session in &sessions {
+            local::chat::cleanup_session_transcript_artifacts(&session.id);
+            local::git::remove_session_worktree(&project, &session.id);
+        }
+    });
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -3760,12 +3770,50 @@ async fn open_project_file(
 
 /// Reveal a checkout file in the OS file manager; unlike open, directories are allowed.
 async fn reveal_project_file(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<OpenProjectFileReq>,
 ) -> ApiResult {
+    reject_if_moving(&state)?;
     blocking_api(move || {
+        let data_dir_lock = crate::store::open_data_dir_move_lock()?;
+        let _data_dir_read = data_dir_lock.try_read().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bad_request("another dashboard is moving the data directory")
+            } else {
+                ApiError::from(anyhow!("could not lock data directory: {error}"))
+            }
+        })?;
+        let _session_reveal = req
+            .session_id
+            .as_deref()
+            .map(|session| {
+                state.chat.begin_worktree_sync(session).ok_or_else(|| {
+                    bad_request("session deletion or another operation is in progress")
+                })
+            })
+            .transpose()?;
+        let store = Store::open()?;
+        let owner = req
+            .session_id
+            .as_deref()
+            .map(|session| store.chat_worktree_owner(session))
+            .transpose()?;
+        let _owner_reveal = owner
+            .as_deref()
+            .filter(|owner| Some(*owner) != req.session_id.as_deref())
+            .map(|owner| {
+                state.chat.begin_worktree_sync(owner).ok_or_else(|| {
+                    bad_request("worktree owner deletion or another operation is in progress")
+                })
+            })
+            .transpose()?;
+        let _admission = state
+            .project_lifecycle
+            .admit(&id)
+            .ok_or_else(|| bad_request("project deletion is in progress"))?;
+        reject_if_moving(&state)?;
         let full = if req.path == "." {
-            let store = Store::open()?;
             let project = store
                 .get_local_project(&id)?
                 .ok_or_else(|| not_found("project"))?;
@@ -8722,6 +8770,39 @@ mod tests {
             assert!(run("moving").success());
             drop(moving);
             assert!(run("normal").success());
+            for (holding, checking) in [
+                ("hold-sync", "sync-held"),
+                ("hold-delete", "deleting"),
+                ("hold-project", "project-held"),
+                ("hold-project-delete", "project-deleting"),
+                ("hold-owner-delete", "owner-deleting"),
+            ] {
+                let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "commands::up::tests::storage_routes_refuse_concurrent_session_deletion",
+                        "--nocapture",
+                    ])
+                    .env("ORX_STORAGE_LIFETIME_TEST_CHILD", holding)
+                    .env("ORX_DATA_DIR", &dir)
+                    .env("XDG_CONFIG_HOME", dir.join("config"))
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut output = std::io::BufReader::new(holder.stdout.take().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert!(std::io::BufRead::read_line(&mut output, &mut line).unwrap() > 0);
+                    if line.trim() == "ORX_LOCK_READY" {
+                        break;
+                    }
+                }
+                let checked = run(checking);
+                drop(holder.stdin.take());
+                assert!(holder.wait().unwrap().success());
+                assert!(checked.success());
+            }
             drop(mover);
             let _ = std::fs::remove_dir_all(dir);
             return;
@@ -8750,7 +8831,50 @@ mod tests {
             dashboard_lock: Default::default(),
             restart: Default::default(),
         };
-        if std::env::var("ORX_STORAGE_LIFETIME_TEST_CHILD").as_deref() == Ok("moving") {
+        let mode = std::env::var("ORX_STORAGE_LIFETIME_TEST_CHILD").unwrap();
+        if mode.starts_with("hold-") {
+            let _sync =
+                (mode == "hold-sync").then(|| state.chat.begin_worktree_sync("session").unwrap());
+            let _delete = (mode == "hold-delete")
+                .then(|| state.chat.begin_session_delete("session").unwrap());
+            let _owner_delete = (mode == "hold-owner-delete")
+                .then(|| state.chat.begin_session_delete("owner").unwrap());
+            let _project =
+                (mode == "hold-project").then(|| state.project_lifecycle.admit("project").unwrap());
+            let _project_delete = (mode == "hold-project-delete")
+                .then(|| state.project_lifecycle.begin_delete("project").unwrap());
+            println!("ORX_LOCK_READY");
+            std::io::Write::flush(&mut std::io::stdout()).unwrap();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new()).unwrap();
+            return;
+        }
+        if mode == "sync-held" {
+            assert!(state.chat.begin_session_delete("session").is_none());
+            assert!(state.chat.begin_session_delete("unrelated").is_some());
+            return;
+        }
+        if mode == "project-held" {
+            assert!(state.project_lifecycle.begin_delete("project").is_none());
+            assert!(state.project_lifecycle.begin_delete("unrelated").is_some());
+            return;
+        }
+        if mode == "project-deleting" {
+            assert!(state.project_lifecycle.admit("project").is_none());
+            let error = reveal_project_file(
+                State(state),
+                Path("project".into()),
+                Json(OpenProjectFileReq {
+                    path: ".".into(),
+                    session_id: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("project deletion"));
+            return;
+        }
+        if mode == "moving" || mode == "deleting" {
             let lookup = session_storage(State(state.clone()), Path("session".into())).await;
             let reveal = reveal_session_storage(
                 State(state.clone()),
@@ -8760,11 +8884,24 @@ mod tests {
                 }),
             )
             .await;
-            let sync = sync_session_worktree(State(state), Path("session".into())).await;
-            for result in [lookup, reveal, sync] {
+            let sync = sync_session_worktree(State(state.clone()), Path("session".into())).await;
+            let worktree = reveal_project_file(
+                State(state),
+                Path("project".into()),
+                Json(OpenProjectFileReq {
+                    path: ".".into(),
+                    session_id: Some("session".into()),
+                }),
+            )
+            .await;
+            for result in [lookup, reveal, sync, worktree] {
                 let error = result.unwrap_err();
                 assert_eq!(error.0, StatusCode::BAD_REQUEST);
-                assert!(error.1.contains("another dashboard"));
+                assert!(error.1.contains(if mode == "moving" {
+                    "another dashboard"
+                } else {
+                    "session deletion"
+                }));
             }
             return;
         }
@@ -8778,7 +8915,16 @@ mod tests {
             }),
         )
         .await;
-        for result in [lookup, reveal] {
+        let worktree = reveal_project_file(
+            State(state.clone()),
+            Path("project".into()),
+            Json(OpenProjectFileReq {
+                path: ".".into(),
+                session_id: Some("session".into()),
+            }),
+        )
+        .await;
+        for result in [lookup, reveal, worktree] {
             let error = result.unwrap_err();
             assert_eq!(error.0, StatusCode::BAD_REQUEST);
             assert!(error.1.contains("session deletion"));
@@ -8786,11 +8932,15 @@ mod tests {
         drop(_deleting);
 
         let store = Store::open().unwrap();
-        let data_dir_lock = crate::store::open_data_dir_move_lock().unwrap();
-        let reading = data_dir_lock.try_read().unwrap();
-        assert!(store.acquire_data_dir_move_lock().is_err());
-        drop(reading);
-        drop(store.acquire_data_dir_move_lock().unwrap());
+        if mode == "normal" {
+            let data_dir_lock = crate::store::open_data_dir_move_lock().unwrap();
+            let reading = data_dir_lock.try_read().unwrap();
+            assert!(store.acquire_data_dir_move_lock().is_err());
+            drop(reading);
+            drop(store.acquire_data_dir_move_lock().unwrap());
+        } else {
+            assert!(store.acquire_data_dir_move_lock().is_err());
+        }
         let mut session = StoredChatSession {
             id: "owner".into(),
             project_id: "project".into(),
@@ -8819,7 +8969,8 @@ mod tests {
         session.side_parent_session_id = Some("owner".into());
         store.create_chat_session(&session).unwrap();
 
-        let deleting = state.chat.begin_session_delete("owner").unwrap();
+        let deleting =
+            (mode != "owner-deleting").then(|| state.chat.begin_session_delete("owner").unwrap());
         let lookup = session_storage(State(state.clone()), Path("side".into())).await;
         let reveal = reveal_session_storage(
             State(state.clone()),
@@ -8829,12 +8980,24 @@ mod tests {
             }),
         )
         .await;
-        for result in [lookup, reveal] {
+        let worktree = reveal_project_file(
+            State(state.clone()),
+            Path("project".into()),
+            Json(OpenProjectFileReq {
+                path: ".".into(),
+                session_id: Some("side".into()),
+            }),
+        )
+        .await;
+        for result in [lookup, reveal, worktree] {
             let error = result.unwrap_err();
             assert_eq!(error.0, StatusCode::BAD_REQUEST);
             assert!(error.1.contains("owner deletion"));
         }
         drop(deleting);
+        if mode == "owner-deleting" {
+            return;
+        }
 
         let storage = state.chat.begin_worktree_sync("side").unwrap();
         assert!(state.chat.delete_session("owner").await.is_err());

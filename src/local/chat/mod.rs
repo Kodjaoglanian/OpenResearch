@@ -3112,11 +3112,13 @@ struct TurnGuard {
 pub struct SessionDeletionLease {
     deleting: Arc<std::sync::Mutex<HashSet<String>>>,
     session_id: String,
+    _shared: crate::store::LifecycleLock,
 }
 
 pub struct SessionWorktreeLease {
     syncing: Arc<std::sync::Mutex<HashSet<String>>>,
     session_id: String,
+    _shared: crate::store::LifecycleLock,
 }
 
 impl Drop for SessionWorktreeLease {
@@ -3804,26 +3806,32 @@ impl ChatHost {
             return None;
         }
         let mut deleting = self.deleting_sessions.lock().unwrap();
-        if !deleting.insert(session_id.to_string()) {
+        if deleting.contains(session_id) {
             return None;
         }
+        let shared = crate::store::acquire_operation_lock("session", session_id, true).ok()?;
+        deleting.insert(session_id.to_string());
         drop(syncing);
         Some(SessionDeletionLease {
             deleting: self.deleting_sessions.clone(),
             session_id: session_id.to_string(),
+            _shared: shared,
         })
     }
 
     pub fn begin_worktree_sync(&self, session_id: &str) -> Option<SessionWorktreeLease> {
         let mut syncing = self.worktree_syncs.lock().unwrap();
         if self.deleting_sessions.lock().unwrap().contains(session_id)
-            || !syncing.insert(session_id.to_string())
+            || syncing.contains(session_id)
         {
             return None;
         }
+        let shared = crate::store::acquire_operation_lock("session", session_id, false).ok()?;
+        syncing.insert(session_id.to_string());
         Some(SessionWorktreeLease {
             syncing: self.worktree_syncs.clone(),
             session_id: session_id.to_string(),
+            _shared: shared,
         })
     }
 
@@ -6546,7 +6554,7 @@ impl ChatHost {
     }
 
     pub async fn delete_session(self: &Arc<Self>, session_id: &str) -> Result<()> {
-        let _deleting = self
+        let deleting = self
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
         for side_chat in Store::open()?.side_chats_of(session_id)? {
@@ -6592,7 +6600,7 @@ impl ChatHost {
             // A side chat runs in its parent's worktree, which outlives it.
             if worktree_owner == session_id {
                 if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
-                    cleanup_session_worktree(&project, session_id);
+                    cleanup_session_worktree(&project, session_id, deleting);
                 }
             }
         }
@@ -6602,10 +6610,15 @@ impl ChatHost {
 
 /// Remove a deleted session's worktree in the background — git + rm are
 /// blocking and best-effort, and must never hold up the delete response.
-pub fn cleanup_session_worktree(project: &LocalProject, session_id: &str) {
+pub fn cleanup_session_worktree(
+    project: &LocalProject,
+    session_id: &str,
+    deleting: SessionDeletionLease,
+) {
     let project = project.clone();
     let session_id = session_id.to_string();
     tokio::task::spawn_blocking(move || {
+        let _deleting = deleting;
         crate::local::git::remove_session_worktree(&project, &session_id);
     });
 }
@@ -9624,6 +9637,47 @@ mod bridge_tests {
             Arc::new(crate::local::codex::CodexHost::new()),
             Arc::new(crate::local::claude::ClaudeHost::new()),
         )
+    }
+
+    #[test]
+    fn worktree_cleanup_retains_deletion_lease_while_queued() {
+        let host = test_host();
+        let id = uuid::Uuid::new_v4().to_string();
+        let project = LocalProject {
+            id: id.clone(),
+            name: id.clone(),
+            slug: id.clone(),
+            github_owner: String::new(),
+            github_repo: String::new(),
+            github_sync_enabled: false,
+            baseline_branch: "main".into(),
+            repo_path: std::env::temp_dir()
+                .join(&id)
+                .to_string_lossy()
+                .into_owned(),
+            run_command: None,
+            paper_id: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (ready, started) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            ready.send(()).unwrap();
+            held.recv().unwrap();
+        });
+        started.recv().unwrap();
+        runtime.block_on(async {
+            cleanup_session_worktree(&project, &id, host.begin_session_delete(&id).unwrap());
+        });
+        assert!(host.begin_worktree_sync(&id).is_none());
+        release.send(()).unwrap();
+        drop(runtime);
+        assert!(host.begin_worktree_sync(&id).is_some());
     }
 
     #[test]

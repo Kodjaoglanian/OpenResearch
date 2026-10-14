@@ -2633,8 +2633,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
 
     let mut outcome = SyncOutcome::default();
     for (act, rel, dest, desired) in plan {
-        // Re-check right before the write: an editor or another process racing
-        // the scan still cannot be clobbered silently.
+        // File copies re-check again after preparing their temporary file.
         if !safe(&entries, &rel, &dest, &desired, &removed, &created_dirs)? {
             return Err(anyhow!(
                 "the project folder changed {rel} during the sync — rerun it"
@@ -2663,41 +2662,60 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                     }
                 } else if meta.is_file() {
                     if fingerprint(&dest) != desired {
-                        // Unlink a destination symlink or an emptied directory
-                        // first: fs::copy would write through one and fail on
-                        // the other.
-                        match std::fs::symlink_metadata(&dest) {
-                            Ok(m) if m.file_type().is_symlink() => {
-                                std::fs::remove_file(&dest).map_err(|e| {
-                                    anyhow!("could not remove {}: {}", dest.display(), e)
-                                })?;
-                            }
-                            Ok(m) if m.is_dir() => {
-                                std::fs::remove_dir_all(&dest).map_err(|e| {
-                                    anyhow!("could not remove {}: {}", dest.display(), e)
-                                })?;
-                            }
-                            _ => {}
-                        }
                         if let Some(parent) = dest.parent() {
                             create_sync_parents(parent, target, &mut created_dirs)?;
                         }
+                        let previous = fingerprint(&dest);
+                        let parents = dest
+                            .parent()
+                            .into_iter()
+                            .flat_map(Path::ancestors)
+                            .take_while(|parent| parent.starts_with(target))
+                            .map(|parent| {
+                                same_file::Handle::from_path(parent)
+                                    .map(|handle| (parent.to_path_buf(), handle))
+                            })
+                            .collect::<std::io::Result<Vec<_>>>()?;
                         // Copy beside the destination and rename over it, so a
                         // hard link to the old file is never written through.
                         let tmp = dest.with_file_name(format!(
                             ".orx-sync-{}.tmp",
                             uuid::Uuid::new_v4().simple()
                         ));
-                        if let Err(e) =
-                            std::fs::copy(&src, &tmp).and_then(|_| std::fs::rename(&tmp, &dest))
-                        {
-                            let _ = std::fs::remove_file(&tmp);
-                            return Err(anyhow!(
-                                "could not copy {} to {}: {}",
+                        let copied = (|| -> Result<bool> {
+                            std::fs::copy(&src, &tmp)?;
+                            #[cfg(test)]
+                            BEFORE_SYNC_REPLACE.with(|hook| {
+                                if let Some(hook) = hook.borrow_mut().take() {
+                                    hook();
+                                }
+                            });
+                            if parents.iter().any(|(path, before)| {
+                                same_file::Handle::from_path(path)
+                                    .map(|after| &after != before)
+                                    .unwrap_or(true)
+                            }) || safe_target_path(target, rel).is_err()
+                                || fingerprint(&dest) != previous
+                                || !safe(&entries, rel, &dest, &desired, &removed, &created_dirs)?
+                            {
+                                return Ok(false);
+                            }
+                            if std::fs::symlink_metadata(&dest).is_ok_and(|m| m.is_dir()) {
+                                std::fs::remove_dir_all(&dest)?;
+                            }
+                            std::fs::rename(&tmp, &dest)?;
+                            Ok(true)
+                        })();
+                        let _ = std::fs::remove_file(&tmp);
+                        if !copied.map_err(|e| {
+                            anyhow!(
+                                "could not copy {} to {}: {e}",
                                 src.display(),
-                                dest.display(),
-                                e
-                            ));
+                                dest.display()
+                            )
+                        })? {
+                            outcome.conflicts.push(rel.clone());
+                            continue;
                         }
                         outcome.copied += 1;
                     }
@@ -2803,6 +2821,12 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         manifest.write(&manifest_path)?;
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SYNC_REPLACE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Canonicalized for stable manifest keys, keeping the path when it does not
@@ -3644,6 +3668,76 @@ mod tests {
     }
 
     #[test]
+    fn sync_preserves_editor_saves_while_preparing_a_copy() {
+        let hub = temp_repo();
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_extension("wt");
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        write(&wt, "seed.txt", "agent contents\n");
+        let destination = hub.join("seed.txt");
+        BEFORE_SYNC_REPLACE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(destination, "user's later save\n").unwrap();
+            }));
+        });
+        let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(outcome.conflicts, ["seed.txt"]);
+        assert_eq!(outcome.copied, 0);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("seed.txt")).unwrap(),
+            "user's later save\n"
+        );
+        assert!(!std::fs::read_dir(&hub).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".orx-sync-")
+        }));
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+            ["seed.txt"]
+        );
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_preserves_replaced_parents_while_preparing_a_copy() {
+        let hub = temp_repo();
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_extension("wt");
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        write(&wt, "dir/agent.txt", "agent contents\n");
+        let target = hub.clone();
+        BEFORE_SYNC_REPLACE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(target.join("dir"), target.join("saved-dir")).unwrap();
+                std::fs::create_dir(target.join("dir")).unwrap();
+            }));
+        });
+        let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(outcome.conflicts, ["dir/agent.txt"]);
+        assert_eq!(outcome.copied, 0);
+        assert!(std::fs::read_dir(hub.join("dir")).unwrap().next().is_none());
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(hub);
+    }
+
+    #[test]
     fn sync_worktree_changes_overlays_files_and_flags_conflicts() {
         let hub = temp_repo();
         write(&hub, "old.txt", "rename me\n");
@@ -4286,8 +4380,8 @@ mod tests {
             .conflicts
             .is_empty());
         assert_eq!(
-            std::fs::read_to_string(hub.join("module/seed.txt")).unwrap(),
-            "module\n"
+            std::fs::read(hub.join("module/seed.txt")).unwrap(),
+            module_before
         );
         run(
             &hub,
