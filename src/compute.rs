@@ -300,7 +300,7 @@ pub trait ComputeBackend: Send + Sync {
         let run = Store::open()?
             .get_run(&handle.id)?
             .ok_or_else(|| anyhow!("Run {} not found.", handle.id))?;
-        crate::commands::supervise::refresh_local_run(run).await
+        crate::commands::supervise::refresh_local_run(run, crate::store::BUSY_TIMEOUT).await
     }
 
     async fn logs(&self, handle: &StoredRun, cursor: LogCursor) -> Result<LogBatch> {

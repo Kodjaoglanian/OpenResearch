@@ -48,6 +48,7 @@ pub(crate) fn supervisor_running(run_id: &str) -> bool {
 /// CLI monitoring must also recover native runs when `orx up` is not running.
 pub(crate) async fn refresh_local_run(
     stored: crate::store::StoredRun,
+    busy_timeout: Duration,
 ) -> Result<crate::store::StoredRun> {
     if !matches!(stored.status.as_str(), "starting" | "running") {
         return Ok(stored);
@@ -69,7 +70,7 @@ pub(crate) async fn refresh_local_run(
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(stored),
             Err(err) => return Err(err.into()),
         };
-        let store = Store::open()?;
+        let store = Store::open_with_busy_timeout(busy_timeout)?;
         let current = store
             .get_run(&stored.id)?
             .ok_or_else(|| anyhow!("Run {} not found in the local store.", stored.id))?;
@@ -80,7 +81,7 @@ pub(crate) async fn refresh_local_run(
     } else {
         crate::commands::exp::spawn_detached_supervise(&stored.id)?;
     }
-    Store::open()?
+    Store::open_with_busy_timeout(busy_timeout)?
         .get_run(&stored.id)?
         .ok_or_else(|| anyhow!("Run {} not found in the local store.", stored.id))
 }

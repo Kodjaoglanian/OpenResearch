@@ -3,6 +3,8 @@ use serde_json::json;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 struct Sandbox(PathBuf);
 impl Sandbox {
@@ -102,6 +104,115 @@ fn native_monitoring_recovers_terminal_status_and_final_logs_without_up() {
             );
         }
     }
+}
+
+#[test]
+fn native_wait_recovers_orphaned_completed_runs() {
+    for args in [
+        vec!["exp", "wait", "exp", "--interval", "1", "--timeout", "5"],
+        vec![
+            "exp",
+            "wait",
+            "--project",
+            "project",
+            "--interval",
+            "1",
+            "--timeout",
+            "5",
+        ],
+    ] {
+        let sandbox = Sandbox::new();
+        let (db, dir) = sandbox.native_run();
+        std::fs::write(dir.join("exit_code"), "0").unwrap();
+        std::fs::write(dir.join("log"), "started\nfinished\n").unwrap();
+        let output = sandbox.run(&args);
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("done"));
+        let status: String = db
+            .query_row("SELECT status FROM runs WHERE id='run'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(
+            std::fs::read_to_string(sandbox.0.join("data/run-logs/run.log")).unwrap(),
+            "started\nfinished\n"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_monitoring_reattaches_to_a_live_worker() {
+    struct WorkerGuard(std::process::Child);
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sandbox = Sandbox::new();
+    let (db, dir) = sandbox.native_run();
+    let mut worker = WorkerGuard(
+        Command::new("sh")
+            .current_dir(&dir)
+            .arg("-c")
+            .arg("printf 'started\\n' > log; until test -e finish; do sleep .1; done; printf 'finished\\n' >> log; printf '0\\n' > exit_code")
+            .spawn()
+            .unwrap(),
+    );
+    std::fs::write(dir.join("pid"), worker.0.id().to_string()).unwrap();
+
+    let output = sandbox.run(&["runs", "project"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("running"));
+
+    let lock_path = sandbox.0.join("data/run-logs/run.supervisor.lock");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .is_ok_and(|file| {
+                let mut lock = fd_lock::RwLock::new(file);
+                lock.try_write()
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+            })
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "supervisor did not reattach");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    std::fs::write(dir.join("finish"), "").unwrap();
+    worker.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while db
+        .query_row("SELECT status FROM runs WHERE id='run'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap()
+        != "done"
+    {
+        assert!(
+            Instant::now() < deadline,
+            "supervisor did not finalize the run"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        std::fs::read_to_string(sandbox.0.join("data/run-logs/run.log")).unwrap(),
+        "started\nfinished\n"
+    );
 }
 
 #[test]
