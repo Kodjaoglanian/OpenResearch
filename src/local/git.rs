@@ -2529,14 +2529,23 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             {
                 return Ok(false);
             }
-            return Ok(files_inside(dest, target)?.iter().all(|f| {
-                removals.contains(f.as_str())
-                    || ((f == rel || created_dirs.contains(f))
-                        && fingerprint(&target.join(f)) == "dir"
-                        && removed
-                            .iter()
-                            .any(|path| path.starts_with(&format!("{f}/"))))
-            }));
+            for f in files_inside(dest, target)? {
+                if removals.contains(f.as_str()) {
+                    continue;
+                }
+                if fingerprint(&target.join(&f)) == "dir"
+                    && removed
+                        .iter()
+                        .any(|path| path.starts_with(&format!("{f}/")))
+                    && (f == rel
+                        || created_dirs.contains(&f)
+                        || base_entry(target, base, &f)?.is_some_and(|e| e.mode.starts_with("04")))
+                {
+                    continue;
+                }
+                return Ok(false);
+            }
+            return Ok(true);
         }
         Ok(current == desired
             || entries.get(rel).is_some_and(|fp| fp == &current)
@@ -3827,6 +3836,63 @@ mod tests {
             std::fs::read_to_string(hub.join("dir1/data.txt")).unwrap(),
             "user directory edit\n"
         );
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_replaces_nested_baseline_directories_but_preserves_user_empty_dirs() {
+        let hub = temp_repo();
+        write(&hub, "dir/nested/a.txt", "baseline\n");
+        run(&hub, &["add", "-A"]);
+        run(&hub, &["commit", "-q", "-m", "seed"]);
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_extension("wt");
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        run(&wt, &["rm", "-r", "-q", "dir"]);
+        write(&wt, "dir", "replacement\n");
+        run(&wt, &["add", "-A"]);
+        std::fs::create_dir(hub.join("dir/nested/user-empty")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+            vec!["dir"]
+        );
+        assert!(hub.join("dir/nested/a.txt").is_file());
+        std::fs::remove_dir(hub.join("dir/nested/user-empty")).unwrap();
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir")).unwrap(),
+            "replacement\n"
+        );
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+
+        run(&wt, &["reset", "-q", "--hard", &base]);
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        run(&wt, &["rm", "-r", "-q", "dir"]);
+        write(&wt, "dir", "replacement again\n");
+        run(&wt, &["add", "-A"]);
+        std::fs::remove_dir_all(hub.join("dir/nested")).unwrap();
+        std::fs::create_dir(hub.join("dir/nested")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+            vec!["dir"]
+        );
+        assert!(hub.join("dir/nested").is_dir());
         run(
             &hub,
             &["worktree", "remove", "--force", &wt.to_string_lossy()],
