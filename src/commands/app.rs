@@ -608,7 +608,7 @@ mod imp {
     #[cfg(target_os = "macos")]
     const MACOS_ESCAPE_SCRIPT: &str = r#"
         window.addEventListener("keydown", (event) => {
-            if (event.key === "Escape" && !event.defaultPrevented && !document.querySelector("dialog:modal, :popover-open")) {
+            if (event.key === "Escape" && !event.defaultPrevented && !document.querySelector("dialog:modal, [popover]:popover-open:not([popover=manual])")) {
                 event.preventDefault();
             }
         });

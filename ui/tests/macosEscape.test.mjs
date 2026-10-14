@@ -19,8 +19,8 @@ function dispatch(key, { modal = false, popover = false, handled = false } = {})
     },
     document: {
       querySelector(selector) {
-        assert.equal(selector, "dialog:modal, :popover-open");
-        return modal || popover ? {} : null;
+        assert.equal(selector, "dialog:modal, [popover]:popover-open:not([popover=manual])");
+        return modal || (popover && popover !== "manual") ? {} : null;
       },
     },
   });
@@ -47,6 +47,10 @@ test("native HTML modal dialogs keep their Escape cancel default", () => {
 
 test("native HTML popovers keep their Escape dismiss default", () => {
   assert.equal(dispatch("Escape", { popover: true }), false);
+});
+
+test("manual tooltips do not enable native fullscreen exit", () => {
+  assert.equal(dispatch("Escape", { popover: "manual" }), true);
 });
 
 test("other keyboard defaults remain intact", () => {
