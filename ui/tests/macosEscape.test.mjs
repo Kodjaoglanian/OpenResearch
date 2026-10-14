@@ -7,7 +7,7 @@ const source = readFileSync(new URL("../../src/commands/app.rs", import.meta.url
 const script = source.match(/const MACOS_ESCAPE_SCRIPT: &str = r#"([\s\S]*?)"#;/)?.[1];
 assert.ok(script, "the macOS webview installs an Escape handler");
 
-function dispatch(key, { modal = false, popover = false, handled = false, modalSupported = true, popoverSupported = true } = {}) {
+function dispatch(key, { modal = false, popover = false, handled = false, modalSupported = true, popoverSupported = true, search = false, readOnly = false, disabled = false } = {}) {
   let listener;
   runInNewContext(script, {
     window: {
@@ -39,6 +39,12 @@ function dispatch(key, { modal = false, popover = false, handled = false, modalS
   const event = {
     key,
     defaultPrevented: handled,
+    target: {
+      matches(selector) {
+        assert.equal(selector, "input[type=search]:enabled:not([readonly])");
+        return search && !readOnly && !disabled;
+      },
+    },
     preventDefault() { this.defaultPrevented = true; },
   };
   listener(event);
@@ -68,6 +74,15 @@ test("manual tooltips do not enable native fullscreen exit", () => {
 test("other keyboard defaults remain intact", () => {
   assert.equal(dispatch("Enter"), false);
   assert.equal(dispatch("f"), false);
+});
+
+test("editable search fields keep WebKit's Escape-to-clear default", () => {
+  assert.equal(dispatch("Escape", { search: true }), false);
+});
+
+test("immutable search fields cannot enable native fullscreen exit", () => {
+  assert.equal(dispatch("Escape", { search: true, readOnly: true }), true);
+  assert.equal(dispatch("Escape", { search: true, disabled: true }), true);
 });
 
 test("older WebKit without popover selectors still prevents idle Escape", () => {

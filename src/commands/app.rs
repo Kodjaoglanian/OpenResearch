@@ -609,6 +609,7 @@ mod imp {
     const MACOS_ESCAPE_SCRIPT: &str = r#"
         window.addEventListener("keydown", (event) => {
             if (event.key !== "Escape" || event.defaultPrevented) return;
+            if (event.target?.matches?.("input[type=search]:enabled:not([readonly])")) return;
             if (CSS.supports("selector(:modal)") && document.querySelector("dialog:modal")) return;
             if (CSS.supports("selector(:popover-open)") && document.querySelector("[popover]:popover-open:not([popover=manual])")) return;
             event.preventDefault();
