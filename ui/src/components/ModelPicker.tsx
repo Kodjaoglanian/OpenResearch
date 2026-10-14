@@ -70,13 +70,13 @@ export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
 
 /** Close-on-outside-click + open state shared by the composer dropdowns (and
  * the session-rail menus). */
-export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>, boundaryRef?: RefObject<HTMLElement | null>) {
+export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (e.target instanceof Node && !ref.current?.contains(e.target) && !triggerRef?.current?.contains(e.target) && !boundaryRef?.current?.contains(e.target)) setOpen(false);
+      if (e.target instanceof Node && !ref.current?.contains(e.target) && !triggerRef?.current?.contains(e.target)) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       // Escape closes the picker and must NOT bubble to other document-level
@@ -98,7 +98,7 @@ export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>, bou
       document.removeEventListener("mousedown", onDown, true);
       document.removeEventListener("keydown", onKey, true);
     };
-  }, [open, triggerRef, boundaryRef]);
+  }, [open, triggerRef]);
   return { open, setOpen, ref };
 }
 

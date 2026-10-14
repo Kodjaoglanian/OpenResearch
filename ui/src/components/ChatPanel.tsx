@@ -80,7 +80,6 @@ import {
   useState,
   type MouseEvent as ReactMouseEvent,
 } from "react";
-import { createPortal } from "react-dom";
 import { BrandMark } from "./Wordmark";
 import {
   type SidebarChatCursor,
@@ -223,7 +222,7 @@ import {
   shouldRecoverLegacyMath,
   tableMarkdown,
 } from "./annotationMarkdown";
-import { Button, IconButton, LoadingRow, MenuItem, showAlert, Spinner, Tooltip } from "./ui";
+import { Button, DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, IconButton, LoadingRow, MenuItem, showAlert, Spinner, Tooltip } from "./ui";
 import { PaperTitle } from "./PaperTitle";
 
 const TOOL_LINE_CLASS_NAME = "tool-line flex-1 min-w-0 line-clamp-2 break-words text-base leading-6";
@@ -4013,7 +4012,7 @@ function TitleReveal({ title, animate }: { title: string; animate: boolean }) {
 /** One Recents row. Hover swaps the timestamp for a three-dot menu with
  * Rename, Archive/Unarchive, and Delete (Claude-desktop style). Rename turns
  * the title into an inline input. */
-function SessionRow({
+export function SessionRow({
   session,
   active,
   unread,
@@ -4040,36 +4039,13 @@ function SessionRow({
   onSetArchived: (archived: boolean) => void;
   onDelete: () => void;
 }) {
-  const triggerRef = useRef<HTMLButtonElement>(null);
   const rowRef = useRef<HTMLDivElement>(null);
-  const { open, setOpen, ref } = usePopover(triggerRef, rowRef);
+  const [open, setOpen] = useState(false);
   const title = session.title?.trim() || "Untitled";
   const [editing, setEditing] = useState(false);
   // Seeded by startEditing() before the input mounts; "" is just a placeholder.
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-
-  useLayoutEffect(() => {
-    if (!open || !ref.current || !triggerRef.current) return;
-    const anchor = triggerRef.current.getBoundingClientRect();
-    const bounds = ref.current.getBoundingClientRect();
-    const left = getComputedStyle(triggerRef.current).direction === "rtl" ? anchor.left : anchor.right - bounds.width;
-    ref.current.style.left = `${Math.max(8, Math.min(left, window.innerWidth - bounds.width - 8))}px`;
-    ref.current.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - bounds.height - 8))}px`;
-    const menu = ref.current;
-    menu.querySelector<HTMLButtonElement>("button")?.focus({ preventScroll: true });
-    const dismiss = (event: Event) => {
-      if (event.type === "scroll" && !(event.target instanceof Node && event.target.contains(triggerRef.current))) return;
-      setOpen(false);
-    };
-    window.addEventListener("scroll", dismiss, true);
-    window.addEventListener("resize", dismiss);
-    return () => {
-      window.removeEventListener("scroll", dismiss, true);
-      window.removeEventListener("resize", dismiss);
-      if (menu.contains(document.activeElement)) triggerRef.current?.focus({ preventScroll: true });
-    };
-  }, [open, ref, setOpen]);
 
   function startEditing() {
     setDraft(session.title?.trim() || "");
@@ -4158,50 +4134,29 @@ function SessionRow({
           unread && <span className="unread-dot" />
         )}
       </span>
-      <button
-        ref={triggerRef}
-        className="session-menu-btn"
-        title={m.chat_panel_session_options()}
-        aria-label={m.chat_panel_session_options()}
-        aria-expanded={open}
-        onClick={(e) => {
-          e.stopPropagation();
-          setOpen((v) => !v);
-        }}
-      >
-        <MoreHorizontal size={14} />
-      </button>
-      {open && createPortal(
-        <div ref={ref} className="option-menu session-menu fixed z-70 flex flex-col max-h-[calc(100vh-1rem)] overflow-y-auto min-w-35 rounded-lg border border-border bg-background p-1.5 shadow-menu">
-          <MenuItem
-            onClick={(e) => {
-              e.stopPropagation();
-              setOpen(false);
-              startEditing();
-            }}
+      <DropdownMenu open={open} onOpenChange={setOpen}>
+        <DropdownMenuTrigger asChild>
+          <button
+            className="session-menu-btn"
+            title={m.chat_panel_session_options()}
+            aria-label={m.chat_panel_session_options()}
+            onClick={(e) => e.stopPropagation()}
           >
+            <MoreHorizontal size={14} />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent className="session-menu" ownerRef={rowRef} restoreFocus={!editing}>
+          <DropdownMenuItem onSelect={startEditing}>
             <span>{m.chat_panel_rename()}</span>
-          </MenuItem>
-          <MenuItem
-            onClick={(e) => {
-              e.stopPropagation();
-              setOpen(false);
-              onSetArchived(!session.archived);
-            }}
-          >
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => onSetArchived(!session.archived)}>
             <span>{session.archived ? m.chat_unarchive() : m.chat_archive()}</span>
-          </MenuItem>
-          <MenuItem danger
-            onClick={(e) => {
-              e.stopPropagation();
-              setOpen(false);
-              onDelete();
-            }}
-          >
+          </DropdownMenuItem>
+          <DropdownMenuItem danger onSelect={onDelete}>
             <span>{m.chat_panel_delete()}</span>
-          </MenuItem>
-        </div>, document.body,
-      )}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }
