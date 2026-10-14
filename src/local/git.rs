@@ -2482,8 +2482,8 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
 
     // The conflict scan, shared by the upfront check and the re-check before
     // each write: the target's current entry is safe to replace when it
-    // already is the desired result, is this source's last synced state, or is
-    // still the base state — anything else is someone's unrecorded edit.
+    // already is the desired result, is this source's last synced state, or,
+    // without sync history, is still the base state.
     let safe = |entries: &std::collections::BTreeMap<String, String>,
                 rel: &str,
                 dest: &Path,
@@ -2585,10 +2585,11 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         }
         Ok(current == desired
             || entries.get(rel).is_some_and(|fp| fp == &current)
-            || current
-                == base_entry(target, base, rel)?
-                    .map(|e| e.fingerprint())
-                    .unwrap_or_default())
+            || (!entries.contains_key(rel)
+                && current
+                    == base_entry(target, base, rel)?
+                        .map(|e| e.fingerprint())
+                        .unwrap_or_default()))
     };
 
     let mut plan = Vec::with_capacity(acts.len());
@@ -4075,6 +4076,60 @@ mod tests {
             &["worktree", "remove", "--force", &wt.to_string_lossy()],
         );
         let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_preserves_user_restorations_to_baseline() {
+        for deleted in [false, true] {
+            let hub = temp_repo();
+            let baseline = std::fs::read(hub.join("seed.txt")).unwrap();
+            let base = run(&hub, &["rev-parse", "HEAD"]);
+            let wt = hub.with_extension("wt");
+            run(
+                &hub,
+                &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+            );
+            if deleted {
+                std::fs::remove_file(wt.join("seed.txt")).unwrap();
+            } else {
+                write(&wt, "seed.txt", "agent contents\n");
+            }
+            assert_eq!(
+                sync_worktree_changes(&wt, &base, &hub).unwrap(),
+                SyncOutcome {
+                    copied: usize::from(!deleted),
+                    deleted: usize::from(deleted),
+                    ..Default::default()
+                }
+            );
+            run(&hub, &["restore", "--worktree", "--", "seed.txt"]);
+            for _ in 0..2 {
+                assert_eq!(
+                    sync_worktree_changes(&wt, &base, &hub).unwrap(),
+                    SyncOutcome {
+                        conflicts: vec!["seed.txt".into()],
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(std::fs::read(hub.join("seed.txt")).unwrap(), baseline);
+            }
+            write(&wt, "seed.txt", "later agent contents\n");
+            assert_eq!(
+                sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+                ["seed.txt"]
+            );
+            assert_eq!(std::fs::read(hub.join("seed.txt")).unwrap(), baseline);
+            write(&hub, "seed.txt", "later agent contents\n");
+            assert_eq!(
+                sync_worktree_changes(&wt, &base, &hub).unwrap(),
+                SyncOutcome::default()
+            );
+            run(
+                &hub,
+                &["worktree", "remove", "--force", &wt.to_string_lossy()],
+            );
+            let _ = std::fs::remove_dir_all(&hub);
+        }
     }
 
     #[test]
