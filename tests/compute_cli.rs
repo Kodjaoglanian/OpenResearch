@@ -144,6 +144,51 @@ fn native_wait_recovers_orphaned_completed_runs() {
     }
 }
 
+#[test]
+fn native_wait_keeps_short_deadlines_during_recovery() {
+    use std::time::{Duration, Instant};
+
+    for (target, timeout) in [(vec!["exp"], 1), (vec!["--project", "project"], 2)] {
+        let sandbox = Sandbox::new();
+        let (db, dir) = sandbox.native_run();
+        std::fs::write(dir.join("exit_code"), "0").unwrap();
+        std::fs::write(dir.join("log"), "finished\n").unwrap();
+        let started = Instant::now();
+        let output = sandbox
+            .command()
+            .args(["exp", "wait"])
+            .args(target)
+            .args(["--interval", "1", "--timeout", &timeout.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(timeout + 1),
+            "recovery extended the wait deadline"
+        );
+        assert!(
+            output.status.success()
+                || String::from_utf8_lossy(&output.stderr).contains("Timed out"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while db
+            .query_row("SELECT status FROM runs WHERE id='run'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+            != "done"
+        {
+            assert!(
+                Instant::now() < deadline,
+                "detached recovery did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn native_monitoring_reattaches_to_a_live_worker() {

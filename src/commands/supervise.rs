@@ -48,7 +48,7 @@ pub(crate) fn supervisor_running(run_id: &str) -> bool {
 /// CLI monitoring must also recover native runs when `orx up` is not running.
 pub(crate) async fn refresh_local_run(
     stored: crate::store::StoredRun,
-    busy_timeout: Duration,
+    wait_for_terminal: bool,
 ) -> Result<crate::store::StoredRun> {
     if !matches!(stored.status.as_str(), "starting" | "running") {
         return Ok(stored);
@@ -62,6 +62,11 @@ pub(crate) async fn refresh_local_run(
     if supervisor_running(&stored.id) {
         return Ok(stored);
     }
+    // Wait commands must not extend their deadline to drain a finished worker's log.
+    if !wait_for_terminal {
+        crate::commands::exp::spawn_detached_supervise(&stored.id)?;
+        return Ok(stored);
+    }
     if is_terminal_stage(&localbox::inspect_job(std::path::Path::new(dir)).stage) {
         // Reuse the supervisor's lock, final log drain, and cancellation-aware transition.
         let mut lock = open_supervisor_lock(&supervisor_lock_path(&stored.id))?;
@@ -70,7 +75,7 @@ pub(crate) async fn refresh_local_run(
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(stored),
             Err(err) => return Err(err.into()),
         };
-        let store = Store::open_with_busy_timeout(busy_timeout)?;
+        let store = Store::open()?;
         let current = store
             .get_run(&stored.id)?
             .ok_or_else(|| anyhow!("Run {} not found in the local store.", stored.id))?;
@@ -81,7 +86,7 @@ pub(crate) async fn refresh_local_run(
     } else {
         crate::commands::exp::spawn_detached_supervise(&stored.id)?;
     }
-    Store::open_with_busy_timeout(busy_timeout)?
+    Store::open()?
         .get_run(&stored.id)?
         .ok_or_else(|| anyhow!("Run {} not found in the local store.", stored.id))
 }

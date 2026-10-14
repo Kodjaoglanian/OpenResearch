@@ -53,10 +53,7 @@ impl LocalPlane {
 
         let mut runs = Vec::new();
         for run in store.list_runs_by_project(project_id)? {
-            runs.push(
-                crate::commands::supervise::refresh_local_run(run, crate::store::BUSY_TIMEOUT)
-                    .await?,
-            );
+            runs.push(crate::commands::supervise::refresh_local_run(run, true).await?);
         }
         let runs: Vec<Run> = runs.iter().map(Run::from).collect();
         Ok(RunListing { runs, titles })
@@ -172,9 +169,7 @@ impl LocalPlane {
 
         match store.latest_run_for_experiment(&exp.id)? {
             Some(r) => {
-                let r =
-                    crate::commands::supervise::refresh_local_run(r, crate::store::BUSY_TIMEOUT)
-                        .await?;
+                let r = crate::commands::supervise::refresh_local_run(r, true).await?;
                 let run = Run::from(&r);
                 let commit = run
                     .commit_sha
@@ -403,20 +398,7 @@ impl LocalPlane {
                     }
                 }
                 Some(r) => {
-                    let r = match crate::commands::supervise::refresh_local_run(
-                        r,
-                        busy_timeout_left(deadline),
-                    )
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(error) if is_db_locked(&error) => {
-                            note_db_locked(&mut lock_notified);
-                            sleep_until_or_timeout(interval, deadline).await?;
-                            continue;
-                        }
-                        Err(error) => return Err(error),
-                    };
+                    let r = crate::commands::supervise::refresh_local_run(r, false).await?;
                     sleep_until_or_timeout(Duration::ZERO, deadline).await?;
                     if last_status.as_deref() != Some(r.status.as_str()) {
                         eprintln!("{}  {}", r.id, r.status);
@@ -472,7 +454,7 @@ impl LocalPlane {
         );
 
         let mut lock_notified = false;
-        'poll: loop {
+        loop {
             sleep_until_or_timeout(interval, deadline).await?;
 
             store.set_busy_timeout(busy_timeout_left(deadline))?;
@@ -486,19 +468,7 @@ impl LocalPlane {
             };
             let mut completed: Vec<(String, Option<String>)> = Vec::new();
             for r in current {
-                let r = match crate::commands::supervise::refresh_local_run(
-                    r,
-                    busy_timeout_left(deadline),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(error) if is_db_locked(&error) => {
-                        note_db_locked(&mut lock_notified);
-                        continue 'poll;
-                    }
-                    Err(error) => return Err(error),
-                };
+                let r = crate::commands::supervise::refresh_local_run(r, false).await?;
                 sleep_until_or_timeout(Duration::ZERO, deadline).await?;
                 if !crate::local::is_terminal(&r.status) {
                     continue;
