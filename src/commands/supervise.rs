@@ -1555,7 +1555,7 @@ mod tests {
     #[tokio::test]
     async fn local_cancel_retries_cleanup_before_reporting_a_dead_launcher_cancelled() {
         use std::os::unix::process::CommandExt;
-        for legacy in [false, true] {
+        for (legacy, late) in [(false, false), (true, false), (false, true)] {
             let temp = crate::local::git::TemporaryDirectory::new("orx-local-cancel-test").unwrap();
             let dir = temp.path().join("run");
             std::fs::create_dir(&dir).unwrap();
@@ -1609,11 +1609,26 @@ mod tests {
                 chat_session_id: None,
             };
             store.upsert_run(&run).unwrap();
-            store.request_cancel(&run.id, "test").unwrap();
+            if !late {
+                store.request_cancel(&run.id, "test").unwrap();
+            }
             let observer = Store::open_at(db).unwrap();
-            let task = tokio::spawn(run_local(store, run.clone(), descriptor, run.id.clone()));
+            let mut supervisor =
+                Box::pin(run_local(store, run.clone(), descriptor, run.id.clone()));
+            if late {
+                let first_poll = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(supervisor.as_mut(), cx))
+                })
+                .await;
+                assert!(first_poll.is_pending());
+                observer.request_cancel(&run.id, "test").unwrap();
+            }
+            let task = tokio::spawn(supervisor);
             tokio::time::sleep(Duration::from_millis(200)).await;
             let pending = observer.get_run(&run.id).unwrap().unwrap();
+            observer
+                .set_result_markdown(&run.id, "cleanup retry releases the database lock")
+                .unwrap();
             if legacy {
                 std::fs::remove_file(dir.join("process_token")).unwrap();
             } else {

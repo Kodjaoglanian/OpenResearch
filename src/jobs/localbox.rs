@@ -894,11 +894,19 @@ mod tests {
             let state = inspect_job(&stale);
             let cancelled = cancel_job(&stale);
             let alive = unrelated.try_wait().unwrap().is_none();
+            std::fs::remove_file(stale.join("pid_script")).unwrap();
+            let unowned = cancel_job(&stale);
+            let unowned_alive = unrelated.try_wait().unwrap().is_none();
             let _ = unrelated.kill();
             unrelated.wait().unwrap();
             assert_eq!(state.stage, "ERROR");
             cancelled.unwrap();
             assert!(alive, "cancellation must not signal a reused PID");
+            assert!(unowned.is_err(), "missing identity must fail closed");
+            assert!(
+                unowned_alive,
+                "missing identity must not signal unrelated work"
+            );
         }
 
         std::env::remove_var("ORX_DATA_DIR");
