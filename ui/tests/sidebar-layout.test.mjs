@@ -12,7 +12,37 @@ test("session menus escape transformed sidebar rows and their scroll clipping", 
   const row = sessionRow.getText(file);
   assert.match(row, /createPortal\([\s\S]*document\.body/);
   assert.match(row, /ref=\{ref\} className="[^"]*fixed z-70/);
-  assert.match(row, /usePopover\(triggerRef\)/);
+  assert.match(row, /usePopover\(triggerRef, rowRef\)/);
+  assert.match(row, /ref=\{rowRef\}/);
+});
+
+test("portaled menus keep their owner row inside the outside-click boundary", () => {
+  const picker = ts.createSourceFile("ModelPicker.tsx", readFileSync(new URL("../src/components/ModelPicker.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const hook = picker.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === "usePopover");
+  const effect = hook.body.statements.find(node => ts.isExpressionStatement(node)
+    && ts.isCallExpression(node.expression) && node.expression.expression.getText(picker) === "useEffect").expression.arguments[0];
+  const js = ts.transpileModule(`return ${effect.getText(picker)}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const listeners = new Map();
+  const menu = new EventTarget(), trigger = new EventTarget(), title = new EventTarget();
+  let closed = 0, focused = 0;
+  const cleanup = new Function("open", "ref", "triggerRef", "boundaryRef", "document", "Node", "setOpen", js)(
+    true,
+    { current: { contains: target => target === menu } },
+    { current: { contains: target => target === trigger, focus: () => focused++ } },
+    { current: { contains: target => target === title } },
+    { addEventListener: (name, handler) => listeners.set(name, handler), removeEventListener: name => listeners.delete(name) },
+    EventTarget,
+    value => { assert.equal(value, false); closed++; },
+  )();
+  for (const target of [menu, trigger, title]) listeners.get("mousedown")({ target });
+  assert.equal(closed, 0);
+  listeners.get("mousedown")({ target: new EventTarget() });
+  assert.equal(closed, 1);
+  listeners.get("keydown")({ key: "Escape", preventDefault() {}, stopPropagation() {} });
+  assert.equal(closed, 2);
+  assert.equal(focused, 1);
+  cleanup();
+  assert.equal(listeners.size, 0);
 });
 
 test("session menus stay in the viewport and dismiss when their anchor moves", () => {
@@ -27,26 +57,36 @@ test("session menus stay in the viewport and dismiss when their anchor moves", (
     const listeners = new Map();
     const style = {};
     let dismissed = 0;
-    const inside = new EventTarget();
-    const cleanup = new Function("open", "ref", "triggerRef", "getComputedStyle", "window", "Node", "setOpen", js)(
+    let focused = 0, restored = 0;
+    class Element extends EventTarget { contains() { return false; } }
+    const inside = new Element();
+    const sidebar = new Element();
+    const trigger = { getBoundingClientRect: () => anchor, focus: () => restored++ };
+    sidebar.contains = target => target === trigger;
+    const cleanup = new Function("open", "ref", "triggerRef", "getComputedStyle", "window", "Node", "setOpen", "document", js)(
       true,
-      { current: { getBoundingClientRect: () => ({ width: 140, height: 120 }), style, contains: target => target === inside } },
-      { current: { getBoundingClientRect: () => anchor } },
+      { current: { getBoundingClientRect: () => ({ width: 140, height: 120 }), style, contains: target => target === inside,
+        querySelector: () => ({ focus: options => { assert.equal(options.preventScroll, true); focused++; } }) } },
+      { current: trigger },
       () => ({ direction }),
       { innerWidth: 500, innerHeight: 400,
         addEventListener: (name, handler) => listeners.set(name, handler),
         removeEventListener: (name, handler) => { assert.equal(listeners.get(name), handler); listeners.delete(name); } },
-      EventTarget,
+      Element,
       value => { assert.equal(value, false); dismissed++; },
+      { activeElement: inside },
     )();
     assert.deepEqual(style, expected);
-    listeners.get("scroll")({ target: inside });
+    assert.equal(focused, 1);
+    listeners.get("scroll")({ type: "scroll", target: inside });
+    listeners.get("scroll")({ type: "scroll", target: new Element() });
     assert.equal(dismissed, 0);
-    listeners.get("scroll")({ target: new EventTarget() });
-    listeners.get("resize")({});
+    listeners.get("scroll")({ type: "scroll", target: sidebar });
+    listeners.get("resize")({ type: "resize" });
     assert.equal(dismissed, 2);
     cleanup();
     assert.equal(listeners.size, 0);
+    assert.equal(restored, 1);
   }
 });
 
