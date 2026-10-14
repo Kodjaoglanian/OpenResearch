@@ -400,7 +400,10 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
         .ok()
         .map(|token| format!("ORX_LOCAL_RUN_TOKEN={token}"));
     let script = std::fs::read_to_string(dir.join("pid_script")).ok();
+    #[cfg(target_os = "linux")]
+    let run_dir = crate::paths::canonicalize(dir)?;
     let mut alive = false;
+    let mut leader_live = false;
     let mut owned = token.is_none() && script.is_none();
     #[cfg(target_os = "linux")]
     for entry in std::fs::read_dir("/proc")? {
@@ -418,17 +421,20 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
         if fields.next() != Some(pid) || matches!(state, Some("Z" | "X")) {
             continue;
         }
+        leader_live |= entry.file_name() == pid;
         let command = match std::fs::read(path.join("cmdline")) {
             Ok(command) => command,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
         owned |= token.is_none()
-            && script.as_ref().is_some_and(|script| {
-                command
-                    .split(|b| *b == 0)
-                    .any(|arg| arg == script.as_bytes())
-            });
+            // Legacy snapshots retain their private cwd even after the launcher exits.
+            && (std::fs::read_link(path.join("cwd")).is_ok_and(|cwd| cwd.starts_with(&run_dir))
+                || script.as_ref().is_some_and(|script| {
+                    command
+                        .split(|b| *b == 0)
+                        .any(|arg| arg == script.as_bytes())
+                }));
         if let Some(token) = &token {
             match std::fs::read(path.join("environ")) {
                 Ok(env) => owned |= env.split(|b| *b == 0).any(|v| v == token.as_bytes()),
@@ -453,13 +459,14 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
     #[cfg(not(target_os = "linux"))]
     {
         let output = std::process::Command::new("ps")
-            .args(["-wwE", "-e", "-o", "pgid=,stat=,command="])
+            .args(["-wwE", "-e", "-o", "pid=,pgid=,stat=,command="])
             .output()?;
         if !output.status.success() {
             return Err(anyhow!("Could not inspect local process group {pid}"));
         }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let mut fields = line.split_whitespace();
+            let member_pid = fields.next();
             if fields.next() != Some(pid)
                 || fields
                     .next()
@@ -468,6 +475,7 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
                 continue;
             }
             alive = true;
+            leader_live |= member_pid == Some(pid);
             owned |= fields.any(|field| {
                 token.as_deref() == Some(field)
                     || (token.is_none() && script.as_deref() == Some(field))
@@ -475,7 +483,7 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
         }
     }
     if alive && !owned {
-        if pid_alive(pid) && !run_alive(dir, pid) {
+        if leader_live && !run_alive(dir, pid) {
             return Ok(false);
         }
         return Err(anyhow!(
@@ -783,7 +791,7 @@ mod tests {
         }
 
         #[cfg(unix)]
-        for dead_leader in 0..3 {
+        for dead_leader in 0..if cfg!(target_os = "linux") { 6 } else { 3 } {
             let resistant = run_job(&LocalJobSpec {
                 run_id: format!("term-resistant-{dead_leader}"),
                 script: "bash -c 'trap \"\" TERM; echo $$ > worker-pid; while :; do echo tick >> heartbeat; sleep 0.1; done' & wait".into(),
@@ -791,6 +799,9 @@ mod tests {
                 secret_env: HashMap::new(),
             })
             .unwrap();
+            if dead_leader >= 3 {
+                std::fs::remove_file(resistant.join("process_token")).unwrap();
+            }
             for _ in 0..100 {
                 if resistant.join("heartbeat").exists() {
                     break;
@@ -801,7 +812,7 @@ mod tests {
             let group = std::fs::read_to_string(resistant.join("pid")).unwrap();
             let worker = std::fs::read_to_string(resistant.join("worker-pid")).unwrap();
             assert!(worker.trim().parse::<u32>().is_ok_and(|pid| pid > 0));
-            if dead_leader == 2 {
+            if dead_leader % 3 == 2 {
                 let parent = std::process::Command::new("ps")
                     .args(["-o", "ppid=", "-p", worker.trim()])
                     .output()
@@ -814,7 +825,7 @@ mod tests {
                     .status()
                     .unwrap();
             }
-            if dead_leader != 0 {
+            if dead_leader % 3 != 0 {
                 std::process::Command::new("kill")
                     .args(["-KILL", group.trim()])
                     .stderr(std::process::Stdio::null())
