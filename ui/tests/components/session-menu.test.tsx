@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { createRef } from "react";
 import { afterEach, expect, test, vi } from "vitest";
 import type { ChatSession } from "../../src/api";
 import { SessionRow } from "../../src/components/ChatPanel";
@@ -15,12 +16,14 @@ function session(id: string, archived = false): ChatSession {
 
 function sidebar(archived = false) {
   const onOpen = vi.fn(), onRename = vi.fn(), onSetArchived = vi.fn(), onDelete = vi.fn();
+  const menuBoundaryRef = createRef<HTMLElement>();
   const view = render(
     <>
-      <section data-testid="sidebar" style={{ overflow: "auto", height: 160 }}>
+      <section ref={menuBoundaryRef} data-testid="sidebar" style={{ overflow: "auto", height: 160 }}>
         {["First chat", "Older chat", "Following chat"].map((id, index) => (
           <div key={id} style={{ transform: `translateY(${index * 34}px)` }}>
             <SessionRow
+              menuBoundaryRef={menuBoundaryRef}
               session={session(id, archived)} active={false} unread={false} busy={false} waiting={false}
               revealTitle={undefined} onOpen={() => onOpen(id)} onRename={(title) => onRename(id, title)}
               onSetArchived={(next) => onSetArchived(id, next)} onDelete={() => onDelete(id)}
@@ -136,6 +139,23 @@ test("unrelated transcript scrolling does not dismiss the menu", async () => {
   await user.click(trigger);
   fireEvent.scroll(screen.getByTestId("transcript"));
   expect(screen.queryByRole("menu")).not.toBeNull();
+});
+
+test("sidebar scrolling hides a fully clipped but still mounted overscanned owner menu", async () => {
+  const { user, trigger } = sidebar();
+  await user.click(trigger);
+  expect(screen.queryByRole("menu")).not.toBeNull();
+  const bounds = vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue(new DOMRect(100, 50, 16, 16));
+  try {
+    fireEvent.scroll(screen.getByTestId("sidebar"));
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    expect(screen.getByText("Older chat").isConnected).toBe(true);
+    const wrapper = screen.getByRole("menu", { hidden: true }).parentElement!;
+    expect(wrapper.style.visibility).toBe("hidden");
+    expect(wrapper.style.pointerEvents).toBe("none");
+  } finally {
+    bounds.mockRestore();
+  }
 });
 
 test("unmounting a virtualized owner row removes its portal", async () => {

@@ -4014,6 +4014,7 @@ function TitleReveal({ title, animate }: { title: string; animate: boolean }) {
  * the title into an inline input. */
 export function SessionRow({
   session,
+  menuBoundaryRef,
   active,
   unread,
   busy,
@@ -4025,6 +4026,7 @@ export function SessionRow({
   onDelete,
 }: {
   session: ChatSession;
+  menuBoundaryRef: React.RefObject<HTMLElement | null>;
   active: boolean;
   unread: boolean;
   busy: boolean;
@@ -4145,7 +4147,7 @@ export function SessionRow({
             <MoreHorizontal size={14} />
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent className="session-menu" ownerRef={rowRef} restoreFocus={!editing}>
+        <DropdownMenuContent className="session-menu" ownerRef={rowRef} collisionBoundary={menuBoundaryRef.current ?? undefined} restoreFocus={!editing}>
           <DropdownMenuItem onSelect={startEditing}>
             <span>{m.chat_panel_rename()}</span>
           </DropdownMenuItem>
@@ -6347,6 +6349,7 @@ export function ChatPanel({
                   <div className={sidebarGrouping === "projects" ? "ms-5.5" : undefined}>
                     <SessionRow
                       key={s.id}
+                      menuBoundaryRef={railBodyRef}
                       session={s}
                       active={s.id === activeId && mainView === "chat"}
                       unread={unreadSessionIds.has(s.id)}
