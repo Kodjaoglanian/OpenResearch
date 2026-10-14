@@ -605,6 +605,15 @@ mod imp {
     #[cfg(target_os = "macos")]
     use wry::WebViewExtMacOS;
 
+    #[cfg(target_os = "macos")]
+    const MACOS_ESCAPE_SCRIPT: &str = r#"
+        window.addEventListener("keydown", (event) => {
+            if (event.key === "Escape" && !event.defaultPrevented && !document.querySelector("dialog:modal, :popover-open")) {
+                event.preventDefault();
+            }
+        });
+    "#;
+
     enum UserEvent {
         ServerReady,
         LoadTimedOut,
@@ -741,17 +750,14 @@ mod imp {
         };
         // The dashboard's --base until the page reports what it shows under the titlebar.
         #[cfg(target_os = "macos")]
-        {
-            disable_fullscreen_escape(&window);
-            set_titlebar_color(
-                &window,
-                None,
-                match window.theme() {
-                    Theme::Dark => [0x0e, 0x0c, 0x0c],
-                    _ => [0xff, 0xff, 0xff],
-                },
-            );
-        }
+        set_titlebar_color(
+            &window,
+            None,
+            match window.theme() {
+                Theme::Dark => [0x0e, 0x0c, 0x0c],
+                _ => [0xff, 0xff, 0xff],
+            },
+        );
 
         let shown = Rc::new(Cell::new(false));
         let replaced = Rc::new(RefCell::new(HashMap::new()));
@@ -834,7 +840,10 @@ mod imp {
             }
         });
         #[cfg(target_os = "macos")]
-        let builder = builder.with_initialization_script("window.__ORX_MAC_TITLEBAR__ = true;");
+        // Run after dashboard handlers; keep overlay dismissal, not WebKit's native fullscreen exit.
+        let builder = builder
+            .with_initialization_script("window.__ORX_MAC_TITLEBAR__ = true;")
+            .with_initialization_script(MACOS_ESCAPE_SCRIPT);
         #[cfg(windows)]
         let builder = builder.with_initialization_script("window.__ORX_WIN_TITLEBAR__ = true;");
         #[cfg(not(target_os = "linux"))]
@@ -943,36 +952,6 @@ mod imp {
             }
             _ => {}
         })
-    }
-
-    #[cfg(target_os = "macos")]
-    fn disable_fullscreen_escape(window: &Window) {
-        use tao::platform::macos::WindowExtMacOS;
-        type CancelOperation = unsafe extern "C-unwind" fn(&AnyObject, Sel, *mut AnyObject);
-        // WebKit handles Escape first; don't let the window's fallback exit fullscreen.
-        unsafe {
-            let ns_window = &*window.ns_window().cast::<AnyObject>();
-            let class: *const AnyClass = ns_window.class();
-            let imp: CancelOperation = ignore_cancel_operation;
-            assert!(
-                objc2::ffi::class_addMethod(
-                    class.cast_mut(),
-                    objc2::sel!(cancelOperation:),
-                    std::mem::transmute::<CancelOperation, objc2::runtime::Imp>(imp),
-                    c"v@:@".as_ptr(),
-                )
-                .as_bool(),
-                "could not disable the window's fullscreen Escape action"
-            );
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    unsafe extern "C-unwind" fn ignore_cancel_operation(
-        _this: &AnyObject,
-        _cmd: Sel,
-        _sender: *mut AnyObject,
-    ) {
     }
 
     fn begin_quit(
