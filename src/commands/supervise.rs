@@ -1266,7 +1266,7 @@ async fn tail_logs_local(
         };
         let _ = log.file.flush();
         if draining && drained {
-            return (seen, last);
+            return (seen + u64::from(prefix.is_some()), last);
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1825,10 +1825,39 @@ mod tests {
         let before = std::fs::read(&split).unwrap();
         std::fs::write(source.join("log"), "a\n\nlast\r\n\nshutdown\n").unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(true);
-        tail_logs_local(source, split.clone(), "run".into(), rx, Some(copied)).await;
+        tail_logs_local(
+            source.clone(),
+            split.clone(),
+            "run".into(),
+            rx,
+            Some(copied),
+        )
+        .await;
         let after = std::fs::read(&split).unwrap();
         assert!(after.starts_with(&before));
         assert_eq!(&after[before.len()..], b"\nshutdown\n");
+        std::fs::write(source.join("log"), "a\nlast").unwrap();
+        let missing = temp.path().join("missing.log");
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let copied = tail_logs_local(source.clone(), missing.clone(), "run".into(), rx, None).await;
+        std::fs::remove_file(source.join("log")).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let unchanged = tail_logs_local(
+            source.clone(),
+            missing.clone(),
+            "run".into(),
+            rx,
+            Some(copied.clone()),
+        )
+        .await;
+        assert_eq!(unchanged, copied);
+        std::fs::write(source.join("log"), "a\nlast shutdown\n").unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        tail_logs_local(source, missing.clone(), "run".into(), rx, Some(unchanged)).await;
+        assert_eq!(
+            std::fs::read_to_string(missing).unwrap(),
+            "a\nlast\n shutdown\n"
+        );
     }
 
     #[tokio::test]
