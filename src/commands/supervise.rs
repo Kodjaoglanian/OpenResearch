@@ -1126,6 +1126,7 @@ async fn run_local(
         path.clone(),
         run_id.clone(),
         done_rx.clone(),
+        None,
     ));
 
     let mut last_status = status_of(&stored)?;
@@ -1144,13 +1145,12 @@ async fn run_local(
         let status = stage_to_run_status(stage);
 
         if is_terminal_stage(stage) {
+            let mut copied = None;
             loop {
                 let _ = done_tx.send(true);
-                if tokio::time::timeout(Duration::from_secs(20), &mut log_task)
-                    .await
-                    .is_err()
-                {
-                    log_task.abort();
+                match tokio::time::timeout(Duration::from_secs(20), &mut log_task).await {
+                    Ok(Ok(position)) => copied = Some(position),
+                    _ => log_task.abort(),
                 }
                 let tx = store.begin_immediate()?;
                 if !cancel_sent && local_cancel_requested(&store, &run_id) {
@@ -1161,6 +1161,7 @@ async fn run_local(
                         path.clone(),
                         run_id.clone(),
                         done_rx.clone(),
+                        copied.clone(),
                     ));
                     cancel_local(&dir, &run_id, &mut cancel_sent);
                     if !cancel_sent {
@@ -1200,12 +1201,14 @@ async fn run_local(
 
 /// Local twin of `tail_logs_ssh` — mirrors the run dir's log into the store's
 /// log file so `orx logs` and the dashboard read the usual place.
+/// `resume` appends after an earlier drain so live readers never see copied bytes rewritten.
 async fn tail_logs_local(
     dir: std::path::PathBuf,
     path: std::path::PathBuf,
     run_id: String,
     done: tokio::sync::watch::Receiver<bool>,
-) {
+    resume: Option<(u64, String)>,
+) -> (u64, String) {
     let mut log = match RunLog::open(&path) {
         Ok(log) => log,
         Err(err) => {
@@ -1213,13 +1216,36 @@ async fn tail_logs_local(
                 "supervise {run_id}: could not open {}: {err}",
                 path.display()
             );
-            return;
+            return resume.unwrap_or_default();
         }
     };
-    let mut seen = 0u64;
+    let (mut seen, mut last) = resume.unwrap_or_default();
+    let mut prefix = None;
+    if seen > 0 {
+        if let Err(err) = log.file.seek(std::io::SeekFrom::End(0)) {
+            eprintln!(
+                "supervise {run_id}: could not resume {}: {err}",
+                path.display()
+            );
+            return (seen, last);
+        }
+        log.replaying = true;
+        // Re-read the last copied line: a drained partial line may have been continued.
+        seen -= 1;
+        prefix = Some(last.clone());
+    }
     loop {
         let draining = *done.borrow();
-        let mut sink = |line: &str| log.line(line);
+        let mut sink = |full: &str| {
+            let line = match prefix.take() {
+                Some(prefix) => full.strip_prefix(prefix.as_str()).unwrap_or(full),
+                None => full,
+            };
+            if !line.is_empty() {
+                log.line(line);
+            }
+            last = full.to_string();
+        };
         let drained = match localbox::stream_logs(&dir, seen, draining, &mut sink) {
             Ok(s) => {
                 seen = s;
@@ -1232,7 +1258,7 @@ async fn tail_logs_local(
         };
         let _ = log.file.flush();
         if draining && drained {
-            return;
+            return (seen, last);
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1745,7 +1771,7 @@ mod tests {
 
         // A respawned supervisor with nothing to replay leaves the log alone.
         let (_tx, rx) = tokio::sync::watch::channel(true);
-        tail_logs_local(source.clone(), path.clone(), "run".into(), rx).await;
+        tail_logs_local(source.clone(), path.clone(), "run".into(), rx, None).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
 
         // A record flushed mid-line stays whole, and the final drain keeps
@@ -1757,22 +1783,32 @@ mod tests {
             path.clone(),
             "run".into(),
             rx,
+            None,
         ));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
         std::fs::write(source.join("log"), "a\n{\"big\": 1}\nlast").unwrap();
         tx.send(true).unwrap();
-        running.await.unwrap();
+        let copied = running.await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "a\n{\"big\": 1}\nlast\n"
         );
         std::fs::write(source.join("log"), "a\n{\"big\": 1}\nlast shutdown\n").unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(true);
-        tail_logs_local(source, path.clone(), "run".into(), rx).await;
+        let copied =
+            tail_logs_local(source.clone(), path.clone(), "run".into(), rx, Some(copied)).await;
+        // Already-copied bytes stay put for live byte-offset readers.
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            "a\n{\"big\": 1}\nlast shutdown\n"
+            "a\n{\"big\": 1}\nlast\n shutdown\n"
+        );
+        std::fs::write(source.join("log"), "a\n{\"big\": 1}\nlast shutdown\ndone\n").unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        tail_logs_local(source, path.clone(), "run".into(), rx, Some(copied)).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a\n{\"big\": 1}\nlast\n shutdown\ndone\n"
         );
     }
 
