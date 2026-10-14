@@ -320,7 +320,7 @@ impl SshHostReader<'_> {
         // that block when the file ends.
         let enclosing = self.current.clone();
         for line in raw.lines() {
-            let line = strip_ssh_comment(line).trim();
+            let line = line.trim();
             if line.is_empty() {
                 continue;
             }
@@ -331,13 +331,16 @@ impl SshHostReader<'_> {
                 ),
                 None => continue,
             };
+            let args = ssh_config_args(value);
+            if args.is_empty() {
+                continue;
+            }
             match key.as_str() {
                 "host" => {
-                    let current = value
-                        .trim_matches('"')
-                        .split_whitespace()
+                    let current = args
+                        .into_iter()
                         .filter(|name| !name.contains(['*', '?', '!']))
-                        .map(|name| self.host_index(name))
+                        .map(|name| self.host_index(&name))
                         .collect();
                     self.current = current;
                     continue;
@@ -348,7 +351,7 @@ impl SshHostReader<'_> {
                     continue;
                 }
                 "include" => {
-                    for pattern in ssh_config_args(value) {
+                    for pattern in args {
                         for file in expand_ssh_include(self.home, &pattern) {
                             self.read_file(&file);
                         }
@@ -364,7 +367,7 @@ impl SshHostReader<'_> {
                 "identityfile" => "identityFile",
                 _ => continue,
             };
-            let value = value.trim_matches('"');
+            let value = args.join(" ");
             for &i in &self.current {
                 // First value wins, like ssh itself.
                 if self.hosts[i].get(field).is_none() {
@@ -390,39 +393,44 @@ impl SshHostReader<'_> {
     }
 }
 
-/// The line before its comment: a `#` outside quotes that starts a word, as
-/// ssh splits arguments (so `"lab#1.conf"` and `alice#1` keep their `#`).
-fn strip_ssh_comment(line: &str) -> &str {
-    let mut quoted = false;
-    let mut word_start = true;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => quoted = !quoted,
-            '#' if !quoted && word_start => return &line[..i],
-            _ => {}
-        }
-        word_start = c.is_whitespace();
-    }
-    line
-}
-
-/// Whitespace-separated arguments, double quotes grouping.
+/// OpenSSH's argument quoting, escapes and word-start comments.
 fn ssh_config_args(value: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut arg = String::new();
-    let mut quoted = false;
-    for c in value.chars() {
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = value.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
-            '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => {
-                if !arg.is_empty() {
+            ' ' | '\t' if quote.is_none() => {
+                if started {
                     args.push(std::mem::take(&mut arg));
+                    started = false;
                 }
             }
-            c => arg.push(c),
+            '#' if !started => break,
+            '\\' if chars.peek().is_some_and(|&next| {
+                matches!(next, '\\' | '\'' | '"') || (quote.is_none() && next == ' ')
+            }) =>
+            {
+                arg.push(chars.next().unwrap());
+                started = true;
+            }
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(c);
+                started = true;
+            }
+            c if quote == Some(c) => quote = None,
+            c => {
+                arg.push(c);
+                started = true;
+            }
         }
     }
-    if !arg.is_empty() {
+    if quote.is_some() {
+        return Vec::new();
+    }
+    if started {
         args.push(arg);
     }
     args
@@ -1558,6 +1566,37 @@ Host b
             "Host before\nInclude missing.conf nowhere.d/* ~/absent/*.conf\nHost after\n",
         )]);
         assert_eq!(names(&ssh_hosts_in(home.path())), ["before", "after"]);
+    }
+
+    #[test]
+    fn ssh_includes_support_single_quotes_and_escaped_spaces() {
+        let home = fake_home(&[
+            (
+                ".ssh/config",
+                r#"Include 'conf.d/lab #1.conf' conf.d/lab\ space.conf conf.d/lab\'s.conf # ignored
+"#,
+            ),
+            (".ssh/conf.d/lab #1.conf", "Host quoted\n"),
+            (".ssh/conf.d/lab space.conf", "Host escaped\n"),
+            (".ssh/conf.d/lab's.conf", "Host apostrophe\n"),
+        ]);
+        assert_eq!(
+            names(&ssh_hosts_in(home.path())),
+            ["quoted", "escaped", "apostrophe"]
+        );
+    }
+
+    #[test]
+    fn ssh_args_preserve_windows_separators_and_quoted_hashes() {
+        assert_eq!(
+            ssh_config_args(r#"C:\Users\alice\lab.conf 'lab #1.conf' lab\ #2.conf "#),
+            [r"C:\Users\alice\lab.conf", "lab #1.conf", "lab #2.conf"]
+        );
+        assert_eq!(
+            ssh_config_args(r#""lab\"quote" 'lab\'quote'"#),
+            ["lab\"quote", "lab'quote"]
+        );
+        assert!(ssh_config_args("'unclosed path").is_empty());
     }
 
     #[test]
