@@ -99,7 +99,7 @@ control.
 
 ## Usage analytics
 
-Official release builds send opt-out, coarse product analytics and feedback events in the background tied to a random
+Official release builds send opt-out, coarse product analytics events and detailed agent feedback in the background tied to a random
 installation ID. They do not include code, prompts, file contents or paths,
 repository names, tokens, emails, or project and experiment identifiers. Feedback reports from the agent are sent for
 bug reports, feature requests, and general frustrations about OpenResearch. Agents are
