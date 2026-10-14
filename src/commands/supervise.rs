@@ -1132,6 +1132,13 @@ async fn run_local(
     let mut cancel_sent = false;
 
     loop {
+        if !cancel_sent && local_cancel_requested(&store, &run_id) {
+            cancel_local(&dir, &run_id, &mut cancel_sent);
+            if !cancel_sent {
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
+        }
         let job = localbox::inspect_job(&dir);
         let stage = job.stage.as_str();
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
@@ -1159,14 +1166,8 @@ async fn run_local(
         }
 
         if status != last_status && store.update_status(&run_id, status, None, None)? {
-            let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
-            if cancel_requested && !cancel_sent {
-                cancel_local(&dir, &run_id, &mut cancel_sent);
-            }
-        } else if !cancel_sent && local_cancel_requested(&store, &run_id) {
-            cancel_local(&dir, &run_id, &mut cancel_sent);
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -1532,6 +1533,86 @@ async fn cancel_ray(address: &str, submission_id: &str, run_id: &str, cancel_sen
 mod tests {
     use super::*;
     use crate::store::StoredRun;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_cancel_retries_cleanup_before_reporting_a_dead_launcher_cancelled() {
+        use std::os::unix::process::CommandExt;
+        let temp = crate::local::git::TemporaryDirectory::new("orx-local-cancel-test").unwrap();
+        let dir = temp.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+        let script = dir.join("run.sh");
+        std::fs::write(&script, "cd \"$(dirname \"$0\")\"; bash -c 'trap \"\" TERM; echo $$ > worker; while :; do sleep 0.1; done' & wait").unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut launcher = std::process::Command::new("bash")
+            .arg(&script)
+            .env("ORX_LOCAL_RUN_TOKEN", &token)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = launcher.id().to_string();
+        std::fs::write(dir.join("pid"), &pid).unwrap();
+        std::fs::write(dir.join("pid_script"), script.to_string_lossy().as_bytes()).unwrap();
+        std::fs::write(dir.join("process_token"), "unverified").unwrap();
+        for _ in 0..100 {
+            if dir.join("worker").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let worker = std::fs::read_to_string(dir.join("worker")).unwrap();
+        assert!(worker.trim().parse::<u32>().is_ok_and(|pid| pid > 0));
+        launcher.kill().unwrap();
+        launcher.wait().unwrap();
+
+        let db = temp.path().join("db");
+        let store = Store::open_at(db.clone()).unwrap();
+        let descriptor = BackendDescriptor::parse(
+            &serde_json::json!({"kind": "local_job", "jobId": dir}).to_string(),
+        )
+        .unwrap();
+        let run = StoredRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            experiment_id: "experiment".into(),
+            project_id: "project".into(),
+            status: "running".into(),
+            backend_json: descriptor.to_json(),
+            command: String::new(),
+            created_at: 1,
+            updated_at: 1,
+            ended_at: None,
+            exit_code: None,
+            commit_sha: None,
+            result_markdown: None,
+            cancel_requested: false,
+            cancel_reason: None,
+            chat_session_id: None,
+        };
+        store.upsert_run(&run).unwrap();
+        store.request_cancel(&run.id, "test").unwrap();
+        let observer = Store::open_at(db).unwrap();
+        let task = tokio::spawn(run_local(store, run.clone(), descriptor, run.id.clone()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let pending = observer.get_run(&run.id).unwrap().unwrap();
+        std::fs::write(dir.join("process_token"), &token).unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(15), task).await;
+        let terminal = observer.get_run(&run.id).unwrap().unwrap();
+        let state = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", worker.trim()])
+            .output()
+            .unwrap();
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stderr(std::process::Stdio::null())
+            .status();
+        assert_eq!(pending.status, "running");
+        assert_eq!(pending.ended_at, None);
+        completed.unwrap().unwrap().unwrap();
+        assert_eq!(terminal.status, "cancelled");
+        assert!(state.status.success() || state.status.code() == Some(1));
+        let state = String::from_utf8_lossy(&state.stdout);
+        assert!(state.trim().is_empty() || state.trim().starts_with('Z'));
+    }
 
     #[test]
     fn recovered_cancel_intent_only_overrides_failed_terminal_state() {
