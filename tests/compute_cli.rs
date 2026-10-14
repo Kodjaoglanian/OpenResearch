@@ -146,31 +146,54 @@ fn native_wait_recovers_orphaned_completed_runs() {
 
 #[test]
 fn native_wait_keeps_short_deadlines_during_recovery() {
+    use std::io::{BufRead, Read};
     use std::time::{Duration, Instant};
 
-    for (target, timeout) in [(vec!["exp"], 1), (vec!["--project", "project"], 2)] {
+    for target in [vec!["exp"], vec!["--project", "project"]] {
         let sandbox = Sandbox::new();
         let (db, dir) = sandbox.native_run();
         std::fs::write(dir.join("exit_code"), "0").unwrap();
         std::fs::write(dir.join("log"), "finished\n").unwrap();
+        let mut lock = fd_lock::RwLock::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(sandbox.0.join("data/run-logs/run.supervisor.lock"))
+                .unwrap(),
+        );
+        let guard = lock.write().unwrap();
         let started = Instant::now();
-        let output = sandbox
+        let mut child = sandbox
             .command()
             .args(["exp", "wait"])
             .args(target)
-            .args(["--interval", "1", "--timeout", &timeout.to_string()])
-            .output()
+            .args(["--interval", "1", "--timeout", "2"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert!(stderr.read_line(&mut line).unwrap() > 0, "{line}");
+            if line.contains("run  running") || line.contains("Watching") {
+                break;
+            }
+        }
+        // The CLI's store is open; reads still work, but a recovering supervisor cannot write.
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        drop(guard);
+        let output = child.wait_with_output().unwrap();
+        let elapsed = started.elapsed();
+        db.execute_batch("ROLLBACK").unwrap();
+        stderr.read_to_string(&mut line).unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(timeout + 1),
+            elapsed < Duration::from_secs(3),
             "recovery extended the wait deadline"
         );
-        assert!(
-            output.status.success()
-                || String::from_utf8_lossy(&output.stderr).contains("Timed out"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(!output.status.success(), "{line}");
+        assert!(line.contains("Timed out"), "{line}");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while db
