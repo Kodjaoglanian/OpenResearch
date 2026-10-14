@@ -2335,6 +2335,11 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         .get(&source_key)
         .cloned()
         .unwrap_or_default();
+    let mut created_dirs = manifest
+        .created_dirs
+        .get(&source_key)
+        .cloned()
+        .unwrap_or_default();
     let other_synced_paths: std::collections::HashSet<String> = manifest
         .sources
         .iter()
@@ -2378,6 +2383,23 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             removals.insert(act.rel());
         }
     }
+    let mut complete_replacements = std::collections::HashSet::new();
+    for act in &acts {
+        let rel = act.rel();
+        let desired = match act {
+            Act::Copy(_) => fingerprint(&checkout_path(source, rel)?),
+            Act::Revert(_) => base_entry(target, base, rel)?
+                .map(|entry| entry.fingerprint())
+                .unwrap_or_default(),
+            Act::Remove(_) => continue,
+        };
+        if !desired.is_empty()
+            && desired != "dir"
+            && fingerprint(&safe_target_path(target, rel)?) == desired
+        {
+            complete_replacements.insert(rel.to_string());
+        }
+    }
 
     // The conflict scan, shared by the upfront check and the re-check before
     // each write: the target's current entry is safe to replace when it
@@ -2387,7 +2409,8 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                 rel: &str,
                 dest: &Path,
                 desired: &str,
-                removed: &std::collections::HashSet<String>|
+                removed: &std::collections::HashSet<String>,
+                created_dirs: &std::collections::BTreeSet<String>|
      -> Result<bool> {
         // Every ancestor the write passes through must be a directory,
         // missing, or itself removed by this sync — a stray file there blocks
@@ -2433,11 +2456,12 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         if current == "dir" {
             return Ok(files_inside(dest, target)?.iter().all(|f| {
                 if f == rel {
-                    removed
-                        .iter()
-                        .any(|path| path.starts_with(&format!("{rel}/")))
+                    created_dirs.contains(rel)
+                        || removed
+                            .iter()
+                            .any(|path| path.starts_with(&format!("{rel}/")))
                 } else {
-                    removals.contains(f.as_str())
+                    removals.contains(f.as_str()) || created_dirs.contains(f)
                 }
             }));
         }
@@ -2454,6 +2478,19 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
     let mut removed = std::collections::HashSet::new();
     for act in &acts {
         let rel = act.rel().to_string();
+        if matches!(act, Act::Remove(_) | Act::Revert(_))
+            && complete_replacements
+                .iter()
+                .any(|parent| rel.starts_with(&format!("{parent}/")))
+        {
+            continue;
+        }
+        if matches!(act, Act::Remove(_))
+            && fingerprint(&checkout_path(source, &rel)?) == "dir"
+            && fingerprint(&safe_target_path(target, &rel)?) == "dir"
+        {
+            continue;
+        }
         let desired = match act {
             Act::Copy(_) => fingerprint(&checkout_path(source, &rel)?),
             Act::Remove(_) => String::new(),
@@ -2462,7 +2499,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                 .unwrap_or_default(),
         };
         let dest = safe_target_path(target, &rel)?;
-        if safe(&entries, &rel, &dest, &desired, &removed)? {
+        if safe(&entries, &rel, &dest, &desired, &removed, &created_dirs)? {
             plan.push((act, rel, dest, desired));
         } else {
             conflicts.push(rel);
@@ -2480,7 +2517,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
     for (act, rel, dest, desired) in plan {
         // Re-check right before the write: an editor or another process racing
         // the scan still cannot be clobbered silently.
-        if !safe(&entries, &rel, &dest, &desired, &removed)? {
+        if !safe(&entries, &rel, &dest, &desired, &removed, &created_dirs)? {
             return Err(anyhow!(
                 "the project folder changed {rel} during the sync — rerun it"
             ));
@@ -2488,20 +2525,19 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         match act {
             Act::Copy(rel) => {
                 if desired.is_empty() {
-                    continue; // the source entry vanished mid-sync
+                    return Err(anyhow!(
+                        "source entry {rel} vanished during sync — rerun it"
+                    ));
                 }
                 let src = checkout_path(source, rel)?;
-                let meta = match std::fs::symlink_metadata(&src) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
+                let meta = std::fs::symlink_metadata(&src).map_err(|e| {
+                    anyhow!("source entry {} vanished during sync: {e}", src.display())
+                })?;
                 if meta.file_type().is_symlink() {
                     if fingerprint(&dest) != desired {
                         remove_entry(&dest)?;
                         if let Some(parent) = dest.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                anyhow!("could not create {}: {}", parent.display(), e)
-                            })?;
+                            create_sync_parents(parent, target, &mut created_dirs)?;
                         }
                         crate::local::native_store::copy_symlink(&src, &dest)
                             .map_err(|e| anyhow!("could not link {}: {}", dest.display(), e))?;
@@ -2526,9 +2562,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                             _ => {}
                         }
                         if let Some(parent) = dest.parent() {
-                            std::fs::create_dir_all(parent).map_err(|e| {
-                                anyhow!("could not create {}: {}", parent.display(), e)
-                            })?;
+                            create_sync_parents(parent, target, &mut created_dirs)?;
                         }
                         std::fs::copy(&src, &dest).map_err(|e| {
                             anyhow!(
@@ -2541,7 +2575,9 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                         outcome.copied += 1;
                     }
                 } else {
-                    continue;
+                    return Err(anyhow!(
+                        "source entry {rel} changed type during sync — rerun it"
+                    ));
                 }
                 // Record the bytes that actually landed — the source may have
                 // changed between the plan and the write.
@@ -2626,6 +2662,9 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         // Persist after every applied act so an interrupted sync still knows
         // what it already wrote.
         manifest.sources.insert(source_key.clone(), entries.clone());
+        manifest
+            .created_dirs
+            .insert(source_key.clone(), created_dirs.clone());
         manifest.write(&manifest_path)?;
     }
     Ok(outcome)
@@ -2819,6 +2858,37 @@ fn files_inside(dir: &Path, root: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn create_sync_parents(
+    parent: &Path,
+    root: &Path,
+    created: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut path = parent;
+    while path != root {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => break,
+            Ok(_) => return Err(anyhow!("cannot create directory {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    path.strip_prefix(root)?
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                );
+            }
+            Err(e) => return Err(e.into()),
+        }
+        path = path
+            .parent()
+            .ok_or_else(|| anyhow!("path outside project folder"))?;
+    }
+    std::fs::create_dir_all(parent)?;
+    created.extend(missing);
+    Ok(())
+}
+
 /// Remove an entry that is no longer wanted, whichever kind it is — a file, a
 /// symlink (the link itself, never its target), or a directory. Reports
 /// whether anything was removed.
@@ -2920,6 +2990,8 @@ fn revert_tree_ok(
 struct SyncManifest {
     #[serde(default)]
     sources: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    created_dirs: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
 }
 
 impl SyncManifest {
@@ -3681,6 +3753,7 @@ mod tests {
         write(&hub, ".gitattributes", "crlf.txt text eol=crlf\n");
         write(&hub, "dir/a.txt", "in dir\n");
         write(&hub, "crlf.txt", "a\r\n"); // stored as LF, checked out as CRLF
+        write(&hub, "nested", "baseline file\n");
         run(&hub, &["add", "-A"]);
         run(&hub, &["commit", "-q", "-m", "seed"]);
         let base = run(&hub, &["rev-parse", "HEAD"]);
@@ -3777,6 +3850,10 @@ mod tests {
             .unwrap()
             .conflicts
             .is_empty());
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
         run(&wt, &["reset", "-q", "--hard", &base]);
         write(&hub, "crlf.txt/output.txt", "user edit\n");
         assert!(!sync_worktree_changes(&wt, &base, &hub)
@@ -3795,6 +3872,37 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(hub.join("crlf.txt")).unwrap(),
             "a\r\n"
+        );
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+        run(&wt, &["rm", "-q", "nested"]);
+        write(&wt, "nested/sub/result.txt", "session output\n");
+        run(&wt, &["add", "-A"]);
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+        run(&wt, &["reset", "-q", "--hard", &base]);
+        std::fs::create_dir_all(hub.join("nested/sub/user-empty")).unwrap();
+        assert!(!sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert!(hub.join("nested/sub/user-empty").is_dir());
+        std::fs::remove_dir(hub.join("nested/sub/user-empty")).unwrap();
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("nested")).unwrap(),
+            "baseline file\n"
         );
 
         run(

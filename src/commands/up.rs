@@ -2915,10 +2915,25 @@ async fn reveal_session_storage(
 async fn sync_session_worktree(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
     blocking_api(move || {
+        let _session_sync = state
+            .chat
+            .begin_worktree_sync(&id)
+            .ok_or_else(|| bad_request("session deletion or sync is in progress"))?;
         let store = Store::open()?;
         let session = store
             .get_chat_session(&id)?
             .ok_or_else(|| not_found("chat session"))?;
+        let owner = store.chat_worktree_owner(&id)?;
+        let _owner_sync = if owner != id {
+            Some(
+                state
+                    .chat
+                    .begin_worktree_sync(&owner)
+                    .ok_or_else(|| bad_request("worktree owner deletion or sync is in progress"))?,
+            )
+        } else {
+            None
+        };
         let _admission = state
             .project_lifecycle
             .admit(&session.project_id)

@@ -2353,6 +2353,7 @@ pub struct ChatHost {
     /// Set once `orx up` commits to restarting into an update; no turn starts after.
     restarting: std::sync::atomic::AtomicBool,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
+    worktree_syncs: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
     /// and marks it resolved — steps that must not interleave for one session,
@@ -3113,6 +3114,17 @@ pub struct SessionDeletionLease {
     session_id: String,
 }
 
+pub struct SessionWorktreeLease {
+    syncing: Arc<std::sync::Mutex<HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for SessionWorktreeLease {
+    fn drop(&mut self) {
+        self.syncing.lock().unwrap().remove(&self.session_id);
+    }
+}
+
 impl Drop for SessionDeletionLease {
     fn drop(&mut self) {
         self.deleting.lock().unwrap().remove(&self.session_id);
@@ -3356,6 +3368,7 @@ impl ChatHost {
             durable_turns: std::sync::Mutex::new(HashMap::new()),
             restarting: std::sync::atomic::AtomicBool::new(false),
             deleting_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            worktree_syncs: Arc::new(std::sync::Mutex::new(HashSet::new())),
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
             pending_permissions: std::sync::Mutex::new(HashMap::new()),
@@ -3786,12 +3799,30 @@ impl ChatHost {
     }
 
     pub fn begin_session_delete(&self, session_id: &str) -> Option<SessionDeletionLease> {
+        let syncing = self.worktree_syncs.lock().unwrap();
+        if syncing.contains(session_id) {
+            return None;
+        }
         let mut deleting = self.deleting_sessions.lock().unwrap();
         if !deleting.insert(session_id.to_string()) {
             return None;
         }
+        drop(syncing);
         Some(SessionDeletionLease {
             deleting: self.deleting_sessions.clone(),
+            session_id: session_id.to_string(),
+        })
+    }
+
+    pub fn begin_worktree_sync(&self, session_id: &str) -> Option<SessionWorktreeLease> {
+        let mut syncing = self.worktree_syncs.lock().unwrap();
+        if self.deleting_sessions.lock().unwrap().contains(session_id)
+            || !syncing.insert(session_id.to_string())
+        {
+            return None;
+        }
+        Some(SessionWorktreeLease {
+            syncing: self.worktree_syncs.clone(),
             session_id: session_id.to_string(),
         })
     }
@@ -9593,6 +9624,19 @@ mod bridge_tests {
             Arc::new(crate::local::codex::CodexHost::new()),
             Arc::new(crate::local::claude::ClaudeHost::new()),
         )
+    }
+
+    #[test]
+    fn session_worktree_sync_excludes_deletion() {
+        let host = test_host();
+        let syncing = host.begin_worktree_sync("owner").unwrap();
+        assert!(host.begin_session_delete("owner").is_none());
+        assert!(host.begin_worktree_sync("owner").is_none());
+        drop(syncing);
+        let deleting = host.begin_session_delete("owner").unwrap();
+        assert!(host.begin_worktree_sync("owner").is_none());
+        drop(deleting);
+        assert!(host.begin_worktree_sync("owner").is_some());
     }
 
     #[tokio::test]
