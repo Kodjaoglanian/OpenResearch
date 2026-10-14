@@ -2365,6 +2365,25 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             }
         }
     }
+    // Gitdir records retain literal paths, even with spaces or newlines on older Git.
+    let mut active_sources = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(common_git_dir(target)?.join("worktrees"))? {
+        let gitfile = std::fs::read_to_string(entry?.path().join("gitdir"))?;
+        if let Some(name) = Path::new(gitfile.trim_end())
+            .parent()
+            .and_then(Path::file_name)
+        {
+            active_sources.insert(name.to_string_lossy().into_owned());
+        }
+    }
+    manifest.sources.retain(|key, _| {
+        Path::new(key)
+            .file_name()
+            .is_some_and(|name| active_sources.contains(name.to_string_lossy().as_ref()))
+    });
+    manifest
+        .created_dirs
+        .retain(|key, _| manifest.sources.contains_key(key));
     let mut entries = manifest
         .sources
         .get(&source_key)
@@ -2483,16 +2502,18 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             .iter()
             .filter(|path| path.as_str() == rel || path.starts_with(&prefix))
         {
+            let baseline = base_entry(target, base, path)?
+                .map(|entry| entry.fingerprint())
+                .unwrap_or_default();
             let expected = if desired == "dir" {
-                base_entry(target, base, path)?
-                    .map(|entry| entry.fingerprint())
-                    .unwrap_or_default()
+                baseline.as_str()
             } else if path == rel {
-                desired.to_string()
+                desired
             } else {
-                String::new()
+                ""
             };
-            if fingerprint(&safe_target_path(target, path)?) != expected {
+            let existing = fingerprint(&safe_target_path(target, path)?);
+            if existing != expected && existing != baseline {
                 return Ok(false);
             }
         }
@@ -2678,8 +2699,8 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                 if remove_entry(&dest)? {
                     outcome.deleted += 1;
                     removed.insert(rel.clone());
+                    entries.insert(rel.clone(), String::new());
                 }
-                entries.insert(rel.clone(), String::new());
             }
             Act::Revert(rel) => match base_entry(target, base, rel)? {
                 None => {
@@ -3901,11 +3922,86 @@ mod tests {
     }
 
     #[test]
-    fn sync_preserves_other_sessions_shared_output() {
+    fn sync_preserves_independent_user_deletion_after_source_restores() {
+        let hub = temp_repo();
+        write(&hub, "code.txt", "baseline\n");
+        run(&hub, &["add", "-A"]);
+        run(&hub, &["commit", "-q", "-m", "baseline"]);
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_extension("wt");
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        std::fs::remove_file(hub.join("code.txt")).unwrap();
+        std::fs::remove_file(wt.join("code.txt")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+        run(&wt, &["reset", "--hard", &base]);
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+        assert!(!hub.join("code.txt").exists());
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_allows_later_edits_to_committed_session_output() {
         let hub = temp_repo();
         let base = run(&hub, &["rev-parse", "HEAD"]);
         let a = hub.with_extension("a");
         let b = hub.with_extension("b");
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &a.to_string_lossy()],
+        );
+        write(&a, "code.txt", "first session\n");
+        assert!(sync_worktree_changes(&a, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        run(&hub, &["add", "-A"]);
+        run(&hub, &["commit", "-q", "-m", "accept first session"]);
+        let accepted = run(&hub, &["rev-parse", "HEAD"]);
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &b.to_string_lossy()],
+        );
+        write(&b, "code.txt", "later session\n");
+        assert!(sync_worktree_changes(&b, &accepted, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("code.txt")).unwrap(),
+            "later session\n"
+        );
+        assert_eq!(
+            sync_worktree_changes(&b, &accepted, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+        for wt in [&a, &b] {
+            run(
+                &hub,
+                &["worktree", "remove", "--force", &wt.to_string_lossy()],
+            );
+        }
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_preserves_other_sessions_shared_output() {
+        let hub = temp_repo();
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let a = hub.with_extension("a");
+        let b = hub.with_extension(if cfg!(unix) { "b\nowner" } else { "b owner" });
         for wt in [&a, &b] {
             run(
                 &hub,
@@ -3931,12 +4027,28 @@ mod tests {
             std::fs::read_to_string(hub.join("paper.pdf")).unwrap(),
             "shared output\n"
         );
-        for wt in [&a, &b] {
-            run(
-                &hub,
-                &["worktree", "remove", "--force", &wt.to_string_lossy()],
-            );
-        }
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &b.to_string_lossy()],
+        );
+        write(&a, "paper.pdf", "new output after other owner deleted\n");
+        assert!(sync_worktree_changes(&a, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("paper.pdf")).unwrap(),
+            "new output after other owner deleted\n"
+        );
+        assert!(
+            !SyncManifest::read(&git_dir(&hub).unwrap().join("orx-sync.json"))
+                .sources
+                .contains_key(b.file_name().unwrap().to_str().unwrap())
+        );
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &a.to_string_lossy()],
+        );
         let _ = std::fs::remove_dir_all(&hub);
     }
 

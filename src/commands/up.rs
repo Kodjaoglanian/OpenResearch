@@ -2851,6 +2851,10 @@ struct RevealSessionStorageReq {
 async fn session_storage(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
     blocking_api(move || {
+        let _session_storage = state
+            .chat
+            .begin_worktree_sync(&id)
+            .ok_or_else(|| bad_request("session deletion or another operation is in progress"))?;
         let store = Store::open()?;
         let session = store
             .get_chat_session(&id)?
@@ -2880,6 +2884,10 @@ async fn reveal_session_storage(
 ) -> ApiResult {
     reject_if_moving(&state)?;
     blocking_api(move || {
+        let _session_storage = state
+            .chat
+            .begin_worktree_sync(&id)
+            .ok_or_else(|| bad_request("session deletion or another operation is in progress"))?;
         let store = Store::open()?;
         let session = store
             .get_chat_session(&id)?
@@ -8645,6 +8653,49 @@ mod tests {
             json!({ "path": "/etc" }),
         ] {
             assert!(serde_json::from_value::<RevealSessionStorageReq>(request).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_routes_refuse_concurrent_session_deletion() {
+        let agent = Arc::new(AgentHost::new(None));
+        let claude = Arc::new(local::claude::ClaudeHost::new());
+        let state = AppState {
+            agent: agent.clone(),
+            chat: Arc::new(ChatHost::new(
+                agent,
+                Arc::new(local::codex::CodexHost::new()),
+                claude.clone(),
+            )),
+            claude,
+            harnesses: Default::default(),
+            project_lifecycle: Default::default(),
+            project_creation_lock: Default::default(),
+            publication_locks: Default::default(),
+            harness_fill_in_flight: Default::default(),
+            claude_catalog_queue: Default::default(),
+            data_dir_move_in_progress: Default::default(),
+            data_dir_gate: Default::default(),
+            remote_sessions: crate::commands::up_remote::RemoteSessionManager::new(),
+            remote_instance_id: None,
+            stopping: Default::default(),
+            dashboard_lock: Default::default(),
+            restart: Default::default(),
+        };
+        let _deleting = state.chat.begin_session_delete("session").unwrap();
+        let lookup = session_storage(State(state.clone()), Path("session".into())).await;
+        let reveal = reveal_session_storage(
+            State(state),
+            Path("session".into()),
+            Json(RevealSessionStorageReq {
+                location: SessionStorageLocation::Artifacts,
+            }),
+        )
+        .await;
+        for result in [lookup, reveal] {
+            let error = result.unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("session deletion"));
         }
     }
 
