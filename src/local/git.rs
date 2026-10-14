@@ -2870,7 +2870,13 @@ fn revert_tree_ok(
         }
         let cdest = safe_target_path(target, &child)?;
         let ccur = fingerprint(&cdest);
-        if ccur.is_empty() || ccur == "dir" || entries.get(&child).is_some_and(|fp| fp == &ccur) {
+        if ccur == "dir" {
+            if base_entry(target, base, &child)?.is_some_and(|e| e.mode == "160000") {
+                continue;
+            }
+            return Ok(false);
+        }
+        if ccur.is_empty() || entries.get(&child).is_some_and(|fp| fp == &ccur) {
             continue;
         }
         if ccur
@@ -3690,6 +3696,20 @@ mod tests {
         // The worktree reverting to the base restores the directory — it does
         // not leave an empty file behind.
         run(&wt, &["reset", "-q", "--hard", &base]);
+        std::fs::remove_file(hub.join("dir")).unwrap();
+        write(&hub, "dir/a.txt/notes.txt", "unrelated user notes\n");
+        let blocked = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(blocked.conflicts, vec!["dir".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir/a.txt/notes.txt")).unwrap(),
+            "unrelated user notes\n"
+        );
+        std::fs::remove_file(hub.join("dir/a.txt/notes.txt")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+            vec!["dir".to_string()]
+        );
+        std::fs::remove_dir(hub.join("dir/a.txt")).unwrap();
         let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
         assert!(outcome.conflicts.is_empty());
         assert!(hub.join("dir").is_dir());

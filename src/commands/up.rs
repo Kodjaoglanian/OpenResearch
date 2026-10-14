@@ -2936,7 +2936,7 @@ async fn sync_session_worktree(State(state): State<AppState>, Path(id): Path<Str
             return Err(ApiError(
                 StatusCode::CONFLICT,
                 format!(
-                    "the project folder also changed {} — move it aside or commit it first",
+                    "the project folder also changed {} — back up and move conflicting paths aside, or compare and reconcile both versions before retrying",
                     outcome.conflicts.join(", ")
                 ),
             ));
