@@ -2312,8 +2312,23 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         }
     }
 
+    let submodules: std::collections::HashSet<String> =
+        split_nul(&git_bytes(source, &["ls-files", "--stage", "-z"], &[])?)
+            .into_iter()
+            .filter_map(|record| {
+                let (entry, path) = record.split_once('\t')?;
+                entry.starts_with("160000 ").then(|| path.to_string())
+            })
+            .collect();
     let mut acts = Vec::new();
     for change in &changed_files(source, base)? {
+        // Submodule pins are not file contents this overlay can copy.
+        if submodules.contains(&change.path)
+            || (change.status == ChangedStatus::Deleted
+                && base_entry(source, base, &change.path)?.is_some_and(|e| e.mode == "160000"))
+        {
+            continue;
+        }
         match change.status {
             ChangedStatus::Deleted => acts.push(Act::Remove(change.path.clone())),
             _ => {
@@ -2494,6 +2509,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             return Ok(files_inside(dest, target)?.iter().all(|f| {
                 removals.contains(f.as_str())
                     || ((f == rel || created_dirs.contains(f))
+                        && fingerprint(&target.join(f)) == "dir"
                         && removed
                             .iter()
                             .any(|path| path.starts_with(&format!("{f}/"))))
@@ -3793,6 +3809,96 @@ mod tests {
             &["worktree", "remove", "--force", &wt.to_string_lossy()],
         );
         let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_skips_submodule_changes_without_blocking_other_files() {
+        let module = temp_repo();
+        write(&module, "seed.txt", "module\n");
+        run(&module, &["add", "-A"]);
+        run(&module, &["commit", "-q", "-m", "module"]);
+        let hub = temp_repo();
+        run(
+            &hub,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &module.to_string_lossy(),
+                "module",
+            ],
+        );
+        run(&hub, &["commit", "-q", "-am", "seed"]);
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_file_name(format!("{}-wt", hub.file_name().unwrap().to_string_lossy()));
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        run(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "-q",
+            ],
+        );
+        write(&wt, "module/seed.txt", "agent module edit\n");
+        write(&wt, "code.txt", "agent\n");
+        assert!(changed_files(&wt, &base)
+            .unwrap()
+            .iter()
+            .any(|change| change.path == "module"));
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("code.txt")).unwrap(),
+            "agent\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("module/seed.txt")).unwrap(),
+            "module\n"
+        );
+
+        run(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &module.to_string_lossy(),
+                "new-module",
+            ],
+        );
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert!(!hub.join("new-module").exists());
+        run(&wt, &["rm", "-f", "-q", "module"]);
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("module/seed.txt")).unwrap(),
+            "module\n"
+        );
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(&hub);
+        let _ = std::fs::remove_dir_all(&module);
     }
 
     #[test]
