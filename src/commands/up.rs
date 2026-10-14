@@ -2851,6 +2851,14 @@ struct RevealSessionStorageReq {
 async fn session_storage(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
     blocking_api(move || {
+        let data_dir_lock = crate::store::open_data_dir_move_lock()?;
+        let _data_dir_read = data_dir_lock.try_read().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bad_request("another dashboard is moving the data directory")
+            } else {
+                ApiError::from(anyhow!("could not lock data directory: {error}"))
+            }
+        })?;
         let _session_storage = state
             .chat
             .begin_worktree_sync(&id)
@@ -2892,6 +2900,14 @@ async fn reveal_session_storage(
 ) -> ApiResult {
     reject_if_moving(&state)?;
     blocking_api(move || {
+        let data_dir_lock = crate::store::open_data_dir_move_lock()?;
+        let _data_dir_read = data_dir_lock.try_read().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bad_request("another dashboard is moving the data directory")
+            } else {
+                ApiError::from(anyhow!("could not lock data directory: {error}"))
+            }
+        })?;
         let _session_storage = state
             .chat
             .begin_worktree_sync(&id)
@@ -2939,6 +2955,14 @@ async fn reveal_session_storage(
 async fn sync_session_worktree(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
     reject_if_moving(&state)?;
     blocking_api(move || {
+        let data_dir_lock = crate::store::open_data_dir_move_lock()?;
+        let _data_dir_read = data_dir_lock.try_read().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                bad_request("another dashboard is moving the data directory")
+            } else {
+                ApiError::from(anyhow!("could not lock data directory: {error}"))
+            }
+        })?;
         let _session_sync = state
             .chat
             .begin_worktree_sync(&id)
@@ -8677,18 +8701,29 @@ mod tests {
         if std::env::var_os("ORX_STORAGE_LIFETIME_TEST_CHILD").is_none() {
             let dir =
                 std::env::temp_dir().join(format!("orx-storage-lifetime-{}", uuid::Uuid::new_v4()));
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "commands::up::tests::storage_routes_refuse_concurrent_session_deletion",
-                    "--nocapture",
-                ])
-                .env("ORX_STORAGE_LIFETIME_TEST_CHILD", "1")
-                .env("ORX_DATA_DIR", &dir)
-                .status()
-                .unwrap();
+            let run = |mode| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "commands::up::tests::storage_routes_refuse_concurrent_session_deletion",
+                        "--nocapture",
+                    ])
+                    .env("ORX_STORAGE_LIFETIME_TEST_CHILD", mode)
+                    .env("ORX_DATA_DIR", &dir)
+                    .env("XDG_CONFIG_HOME", dir.join("config"))
+                    .status()
+                    .unwrap()
+            };
+            let mut mover = crate::store::open_lifecycle_lock_at(
+                &dir.join("config/openresearch/orx.data-dir-move.lock"),
+            )
+            .unwrap();
+            let moving = mover.try_write().unwrap();
+            assert!(run("moving").success());
+            drop(moving);
+            assert!(run("normal").success());
+            drop(mover);
             let _ = std::fs::remove_dir_all(dir);
-            assert!(status.success());
             return;
         }
         let agent = Arc::new(AgentHost::new(None));
@@ -8715,6 +8750,24 @@ mod tests {
             dashboard_lock: Default::default(),
             restart: Default::default(),
         };
+        if std::env::var("ORX_STORAGE_LIFETIME_TEST_CHILD").as_deref() == Ok("moving") {
+            let lookup = session_storage(State(state.clone()), Path("session".into())).await;
+            let reveal = reveal_session_storage(
+                State(state.clone()),
+                Path("session".into()),
+                Json(RevealSessionStorageReq {
+                    location: SessionStorageLocation::Artifacts,
+                }),
+            )
+            .await;
+            let sync = sync_session_worktree(State(state), Path("session".into())).await;
+            for result in [lookup, reveal, sync] {
+                let error = result.unwrap_err();
+                assert_eq!(error.0, StatusCode::BAD_REQUEST);
+                assert!(error.1.contains("another dashboard"));
+            }
+            return;
+        }
         let _deleting = state.chat.begin_session_delete("session").unwrap();
         let lookup = session_storage(State(state.clone()), Path("session".into())).await;
         let reveal = reveal_session_storage(
@@ -8733,6 +8786,11 @@ mod tests {
         drop(_deleting);
 
         let store = Store::open().unwrap();
+        let data_dir_lock = crate::store::open_data_dir_move_lock().unwrap();
+        let reading = data_dir_lock.try_read().unwrap();
+        assert!(store.acquire_data_dir_move_lock().is_err());
+        drop(reading);
+        drop(store.acquire_data_dir_move_lock().unwrap());
         let mut session = StoredChatSession {
             id: "owner".into(),
             project_id: "project".into(),

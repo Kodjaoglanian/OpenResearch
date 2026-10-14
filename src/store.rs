@@ -91,6 +91,10 @@ fn data_dir_move_lock_path() -> PathBuf {
     crate::config::config_dir().join("orx.data-dir-move.lock")
 }
 
+pub(crate) fn open_data_dir_move_lock() -> Result<fd_lock::RwLock<std::fs::File>> {
+    open_lifecycle_lock_at(&data_dir_move_lock_path())
+}
+
 pub(crate) struct DataDirMoveLock {
     release: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,

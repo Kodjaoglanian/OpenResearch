@@ -2341,7 +2341,22 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
     }
 
     let git_dir = git_dir(target)?;
-    let _lock = SyncLock::acquire(&git_dir.join("orx-sync.lock"))?;
+    let lock_path = git_dir.join("orx-sync.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| anyhow!("could not lock {}: {}", lock_path.display(), e))?;
+    let mut sync_lock = fd_lock::RwLock::new(lock_file);
+    let _sync_guard = sync_lock.try_write().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow!("another sync is already writing to this project folder")
+        } else {
+            anyhow!("could not lock {}: {}", lock_path.display(), e)
+        }
+    })?;
     let manifest_path = git_dir.join("orx-sync.json");
     let mut manifest = SyncManifest::read(&manifest_path);
     // Keyed by the worktree's directory name (its owning session), which a
@@ -2737,6 +2752,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                         &[
                             "--literal-pathspecs",
                             "restore",
+                            "--overlay",
                             "--worktree",
                             "--source",
                             base,
@@ -3143,42 +3159,6 @@ impl SyncManifest {
                 .map_err(|e| anyhow!("could not write {}: {}", path.display(), e))?;
         }
         Ok(())
-    }
-}
-
-/// Held for the duration of one sync: created with `create_new` so a second
-/// sync of the same target fails fast instead of racing writes. A lock file
-/// older than the stale window is left by a crashed holder and is broken.
-struct SyncLock(PathBuf);
-
-impl SyncLock {
-    fn acquire(path: &Path) -> Result<Self> {
-        const STALE: Duration = Duration::from_secs(5 * 60);
-        let old = path
-            .metadata()
-            .and_then(|m| m.modified())
-            .map(|t| t.elapsed().unwrap_or_default() > STALE)
-            .unwrap_or(false);
-        if old {
-            let _ = std::fs::remove_file(path);
-        }
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(_) => Ok(Self(path.to_path_buf())),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
-                "another sync is already writing to this project folder"
-            )),
-            Err(e) => Err(anyhow!("could not lock {}: {}", path.display(), e)),
-        }
-    }
-}
-
-impl Drop for SyncLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -3920,12 +3900,30 @@ mod tests {
             );
             assert_eq!(std::fs::read_dir(hub.join("dir")).unwrap().count(), 0);
         }
-        std::fs::remove_dir(hub.join("dir")).unwrap();
-        write(&hub, "dir", "replacement\n");
+        run(
+            &hub,
+            &[
+                "restore",
+                "--worktree",
+                "--source",
+                &base,
+                "--",
+                "dir/nested/a.txt",
+            ],
+        );
+        write(&hub, "dir/user.txt", "staged version\n");
+        run(&hub, &["add", "dir/user.txt"]);
+        write(&hub, "dir/user.txt", "user unstaged version\n");
         assert!(sync_worktree_changes(&wt, &base, &hub)
             .unwrap()
             .conflicts
             .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir/user.txt")).unwrap(),
+            "user unstaged version\n"
+        );
+        run(&hub, &["reset", "-q", "--", "dir/user.txt"]);
+        std::fs::remove_file(hub.join("dir/user.txt")).unwrap();
         run(&wt, &["rm", "-r", "-q", "dir"]);
         write(&wt, "dir", "replacement again\n");
         run(&wt, &["add", "-A"]);
@@ -3936,6 +3934,48 @@ mod tests {
             vec!["dir"]
         );
         assert!(hub.join("dir/nested").is_dir());
+        run(
+            &hub,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()],
+        );
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn sync_lock_does_not_expire_while_held() {
+        let hub = temp_repo();
+        let base = run(&hub, &["rev-parse", "HEAD"]);
+        let wt = hub.with_extension("wt");
+        run(
+            &hub,
+            &["worktree", "add", "-q", "--detach", &wt.to_string_lossy()],
+        );
+        let path = git_dir(&hub).unwrap().join("orx-sync.lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        let mut lock = fd_lock::RwLock::new(file);
+        let holder = lock.try_write().unwrap();
+        holder
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(600)),
+            )
+            .unwrap();
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap_err()
+            .to_string()
+            .contains("another sync"));
+        drop(holder);
+        drop(lock);
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
         run(
             &hub,
             &["worktree", "remove", "--force", &wt.to_string_lossy()],
@@ -4187,6 +4227,7 @@ mod tests {
         );
         run(&hub, &["commit", "-q", "-am", "seed"]);
         let base = run(&hub, &["rev-parse", "HEAD"]);
+        let module_before = std::fs::read(hub.join("module/seed.txt")).unwrap();
         let wt = hub.with_file_name(format!("{}-wt", hub.file_name().unwrap().to_string_lossy()));
         run(
             &hub,
@@ -4218,8 +4259,8 @@ mod tests {
             "agent\n"
         );
         assert_eq!(
-            std::fs::read_to_string(hub.join("module/seed.txt")).unwrap(),
-            "module\n"
+            std::fs::read(hub.join("module/seed.txt")).unwrap(),
+            module_before
         );
 
         run(
