@@ -2848,12 +2848,18 @@ struct RevealSessionStorageReq {
     location: SessionStorageLocation,
 }
 
-async fn session_storage(Path(id): Path<String>) -> ApiResult {
+async fn session_storage(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
     blocking_api(move || {
         let store = Store::open()?;
         let session = store
             .get_chat_session(&id)?
             .ok_or_else(|| not_found("chat session"))?;
+        let _admission = state
+            .project_lifecycle
+            .admit(&session.project_id)
+            .ok_or_else(|| bad_request("project deletion is in progress"))?;
+        reject_if_moving(&state)?;
         let project = store
             .get_local_project(&session.project_id)?
             .ok_or_else(|| not_found("project"))?;

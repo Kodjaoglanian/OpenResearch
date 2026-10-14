@@ -2336,13 +2336,19 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         .cloned()
         .unwrap_or_default();
 
+    let mut reverted_trees = Vec::new();
     for rel in entries.keys() {
-        if acts.iter().all(|a| {
-            a.rel() != rel.as_str()
-                && !matches!(a, Act::Revert(parent) if rel.starts_with(&format!("{parent}/")))
-        }) {
-            acts.push(Act::Revert(rel.clone()));
+        if acts.iter().any(|a| a.rel() == rel.as_str())
+            || reverted_trees
+                .iter()
+                .any(|prefix: &String| rel.starts_with(prefix))
+        {
+            continue;
         }
+        if base_entry(target, base, rel)?.is_some_and(|entry| entry.mode.starts_with("04")) {
+            reverted_trees.push(format!("{rel}/"));
+        }
+        acts.push(Act::Revert(rel.clone()));
     }
     // Deepest removals first, copies last: a file replacing a directory needs
     // the old contents gone before it can be written.
@@ -2353,13 +2359,14 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             a.rel().to_string(),
         )
     });
-    let removals: std::collections::HashSet<&str> = acts
-        .iter()
-        .filter_map(|a| match a {
-            Act::Remove(rel) => Some(rel.as_str()),
-            _ => None,
-        })
-        .collect();
+    let mut removals = std::collections::HashSet::new();
+    for act in &acts {
+        if matches!(act, Act::Remove(_))
+            || (matches!(act, Act::Revert(_)) && base_entry(target, base, act.rel())?.is_none())
+        {
+            removals.insert(act.rel());
+        }
+    }
 
     // The conflict scan, shared by the upfront check and the re-check before
     // each write: the target's current entry is safe to replace when it
@@ -2408,7 +2415,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         if current == "dir" {
             return Ok(files_inside(dest, target)?
                 .iter()
-                .all(|f| removals.contains(f.as_str())));
+                .all(|f| f != rel && removals.contains(f.as_str())));
         }
         Ok(current == desired
             || entries.get(rel).is_some_and(|fp| fp == &current)
@@ -2752,13 +2759,22 @@ fn safe_target_path(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Entries a directory replacement would remove; nested `.git` directories
-/// count as protected leaves, even when empty.
+/// Entries a directory replacement would remove, including empty directories
+/// and nested `.git` directories as protected leaves.
 fn files_inside(dir: &Path, root: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let read = std::fs::read_dir(&dir)?;
+        let mut read = std::fs::read_dir(&dir)?.peekable();
+        if read.peek().is_none() {
+            out.push(
+                dir.strip_prefix(root)?
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            );
+        }
         for entry in read {
             let entry = entry?;
             let path = entry.path();
@@ -3670,6 +3686,11 @@ mod tests {
         assert!(hub.join("dir/extra.txt").is_file());
 
         std::fs::remove_file(hub.join("dir/extra.txt")).unwrap();
+        std::fs::create_dir_all(hub.join("dir/empty-user-directory")).unwrap();
+        let blocked = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(blocked.conflicts, vec!["dir".to_string()]);
+        assert!(hub.join("dir/empty-user-directory").is_dir());
+        std::fs::remove_dir(hub.join("dir/empty-user-directory")).unwrap();
         write(&hub, "dir/.git/config", "unrelated nested repository\n");
         let blocked = sync_worktree_changes(&wt, &base, &hub).unwrap();
         assert_eq!(blocked.conflicts, vec!["dir".to_string()]);
@@ -3717,6 +3738,33 @@ mod tests {
             std::fs::read_to_string(hub.join("dir/a.txt")).unwrap(),
             "in dir\n"
         );
+        assert_eq!(
+            std::fs::read_to_string(hub.join("crlf.txt")).unwrap(),
+            "a\r\n"
+        );
+
+        run(&wt, &["rm", "-q", "crlf.txt"]);
+        write(&wt, "crlf.txt/output.txt", "agent result\n");
+        run(&wt, &["add", "-A"]);
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        run(&wt, &["reset", "-q", "--hard", &base]);
+        write(&hub, "crlf.txt/output.txt", "user edit\n");
+        assert!(!sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(hub.join("crlf.txt/output.txt")).unwrap(),
+            "user edit\n"
+        );
+        write(&hub, "crlf.txt/output.txt", "agent result\n");
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
         assert_eq!(
             std::fs::read_to_string(hub.join("crlf.txt")).unwrap(),
             "a\r\n"

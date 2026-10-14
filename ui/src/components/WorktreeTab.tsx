@@ -8,7 +8,7 @@ import {
   queryClient,
 } from "../queries/client";
 
-import { getCodeTreeQuery, getSessionWorktreeQuery } from "../queries/files";
+import { getCodeTreeQuery, getSessionStorageQuery, getSessionWorktreeQuery } from "../queries/files";
 import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
 // The pinned Files home for the active chat session's private worktree — what
@@ -30,7 +30,6 @@ import { ltr } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   fmtNumber,
-  getSessionStorage,
   githubBranchUrl,
   manageProjectFile,
   revealFileInManager,
@@ -100,7 +99,10 @@ export function WorktreeTab({
   const [contextMenu, setContextMenu] = useState<FileContextMenuTarget | null>(null);
   const [renamingPath, setRenamingPath] = useState<string | null>(null);
   const load = useCallback(() => {
-    if (sessionId) void queryClient.invalidateQueries(getSessionWorktreeQuery(sessionId));
+    if (sessionId) {
+      void queryClient.invalidateQueries(getSessionWorktreeQuery(sessionId));
+      void queryClient.invalidateQueries(getSessionStorageQuery(sessionId));
+    }
     void queryClient.invalidateQueries({ queryKey: workspaceKey("getCodeTree", projectId), predicate: (query) => !isImmutableQuery(query) });
   }, [sessionId, projectId]);
   const wasBusy = useRef(busy);
@@ -152,9 +154,9 @@ export function WorktreeTab({
   const [syncing, setSyncing] = useState(false);
   const [showStorage, setShowStorage] = useState(false);
   const storage = useQuery({
-    queryKey: workspaceKey("getSessionStorage", sessionId ?? ""),
-    queryFn: ({ signal }) => getSessionStorage(sessionId ?? "", signal),
+    ...getSessionStorageQuery(sessionId ?? ""),
     enabled: Boolean(sessionId) && showStorage,
+    refetchInterval: busy ? 5_000 : false,
   });
   /** Overlay this worktree's changes into the project folder — the explicit
    * "land my work in the folder I picked" action. */
