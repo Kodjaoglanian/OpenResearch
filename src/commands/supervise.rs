@@ -1237,12 +1237,20 @@ async fn tail_logs_local(
     loop {
         let draining = *done.borrow();
         let mut sink = |full: &str| {
-            let line = match prefix.take() {
-                Some(prefix) => full.strip_prefix(prefix.as_str()).unwrap_or(full),
-                None => full,
-            };
-            if !line.is_empty() {
-                log.line(line);
+            if let Some(prefix) = prefix.take() {
+                let line = full
+                    .strip_prefix(prefix.as_str())
+                    .or_else(|| {
+                        prefix
+                            .strip_suffix('\r')
+                            .and_then(|prefix| full.strip_prefix(prefix))
+                    })
+                    .unwrap_or(full);
+                if !line.is_empty() {
+                    log.line(line);
+                }
+            } else {
+                log.line(full);
             }
             last = full.to_string();
         };
@@ -1805,11 +1813,22 @@ mod tests {
         );
         std::fs::write(source.join("log"), "a\n{\"big\": 1}\nlast shutdown\ndone\n").unwrap();
         let (_tx, rx) = tokio::sync::watch::channel(true);
-        tail_logs_local(source, path.clone(), "run".into(), rx, Some(copied)).await;
+        tail_logs_local(source.clone(), path.clone(), "run".into(), rx, Some(copied)).await;
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "a\n{\"big\": 1}\nlast\n shutdown\ndone\n"
         );
+        let split = temp.path().join("split.log");
+        std::fs::write(source.join("log"), "a\n\nlast\r").unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        let copied = tail_logs_local(source.clone(), split.clone(), "run".into(), rx, None).await;
+        let before = std::fs::read(&split).unwrap();
+        std::fs::write(source.join("log"), "a\n\nlast\r\n\nshutdown\n").unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        tail_logs_local(source, split.clone(), "run".into(), rx, Some(copied)).await;
+        let after = std::fs::read(&split).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(&after[before.len()..], b"\nshutdown\n");
     }
 
     #[tokio::test]
