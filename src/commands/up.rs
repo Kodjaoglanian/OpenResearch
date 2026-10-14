@@ -2868,14 +2868,21 @@ async fn session_storage(Path(id): Path<String>) -> ApiResult {
 }
 
 async fn reveal_session_storage(
+    State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<RevealSessionStorageReq>,
 ) -> ApiResult {
+    reject_if_moving(&state)?;
     blocking_api(move || {
         let store = Store::open()?;
         let session = store
             .get_chat_session(&id)?
             .ok_or_else(|| not_found("chat session"))?;
+        let _admission = state
+            .project_lifecycle
+            .admit(&session.project_id)
+            .ok_or_else(|| bad_request("project deletion is in progress"))?;
+        reject_if_moving(&state)?;
         let project = store
             .get_local_project(&session.project_id)?
             .ok_or_else(|| not_found("project"))?;
@@ -2899,12 +2906,18 @@ async fn reveal_session_storage(
 /// picked it. A file overlay, not a merge: the folder's branch is untouched
 /// and files arrive uncommitted for review. Paths the folder itself changed
 /// since the fork come back as conflicts instead of being overwritten.
-async fn sync_session_worktree(Path(id): Path<String>) -> ApiResult {
+async fn sync_session_worktree(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    reject_if_moving(&state)?;
     blocking_api(move || {
         let store = Store::open()?;
         let session = store
             .get_chat_session(&id)?
             .ok_or_else(|| not_found("chat session"))?;
+        let _admission = state
+            .project_lifecycle
+            .admit(&session.project_id)
+            .ok_or_else(|| bad_request("project deletion is in progress"))?;
+        reject_if_moving(&state)?;
         let project = store
             .get_local_project(&session.project_id)?
             .ok_or_else(|| not_found("project"))?;
@@ -8582,6 +8595,20 @@ pub(crate) async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_operations_remain_counted_until_writes_finish() {
+        let lifecycle = ProjectLifecycle::default();
+        let sync = lifecycle.admit("project").unwrap();
+        let reveal = lifecycle.admit("project").unwrap();
+        assert_eq!(lifecycle.operation_count(), 2);
+        assert!(lifecycle.begin_delete("project").is_none());
+        drop(sync);
+        assert_eq!(lifecycle.operation_count(), 1);
+        drop(reveal);
+        assert_eq!(lifecycle.operation_count(), 0);
+        assert!(lifecycle.begin_delete("project").is_some());
+    }
 
     #[test]
     fn storage_reveal_accepts_only_known_locations() {

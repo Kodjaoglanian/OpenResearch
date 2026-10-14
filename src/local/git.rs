@@ -2406,7 +2406,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         // stand in for that check ("dir" matches any directory, including the
         // base's).
         if current == "dir" {
-            return Ok(files_inside(dest, target)
+            return Ok(files_inside(dest, target)?
                 .iter()
                 .all(|f| removals.contains(f.as_str())));
         }
@@ -2545,7 +2545,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                         // stay put.
                         let keep: std::collections::HashSet<&str> =
                             children.iter().map(String::as_str).collect();
-                        for f in files_inside(&dest, target) {
+                        for f in files_inside(&dest, target)? {
                             if f.starts_with(&format!("{rel}/")) && !keep.contains(f.as_str()) {
                                 let fdest = safe_target_path(target, &f)?;
                                 if entries.get(&f).is_some_and(|fp| fp == &fingerprint(&fdest)) {
@@ -2752,22 +2752,20 @@ fn safe_target_path(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Every non-directory entry under `dir`, as forward-slash paths relative to
-/// `root` — what a directory being replaced would carry away with it.
-fn files_inside(dir: &Path, root: &Path) -> Vec<String> {
+/// Entries a directory replacement would remove; nested `.git` directories
+/// count as protected leaves, even when empty.
+fn files_inside(dir: &Path, root: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(read) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in read.flatten() {
-            if entry.file_name() == ".git" {
-                continue;
-            }
+        let read = std::fs::read_dir(&dir)?;
+        for entry in read {
+            let entry = entry?;
             let path = entry.path();
-            match entry.file_type() {
-                Ok(t) if t.is_dir() && !t.is_symlink() => stack.push(path),
+            match entry.file_type()? {
+                t if t.is_dir() && !t.is_symlink() && entry.file_name() != ".git" => {
+                    stack.push(path)
+                }
                 _ => {
                     if let Ok(rel) = path.strip_prefix(root) {
                         out.push(
@@ -2781,7 +2779,7 @@ fn files_inside(dir: &Path, root: &Path) -> Vec<String> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Remove an entry that is no longer wanted, whichever kind it is — a file, a
@@ -3665,8 +3663,22 @@ mod tests {
         assert!(hub.join("dir/a.txt").is_file());
         assert!(hub.join("dir/extra.txt").is_file());
 
-        // Once only removable content remains, the file lands.
         std::fs::remove_file(hub.join("dir/extra.txt")).unwrap();
+        write(&hub, "dir/.git/config", "unrelated nested repository\n");
+        let blocked = sync_worktree_changes(&wt, &base, &hub).unwrap();
+        assert_eq!(blocked.conflicts, vec!["dir".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(hub.join("dir/.git/config")).unwrap(),
+            "unrelated nested repository\n"
+        );
+        std::fs::remove_file(hub.join("dir/.git/config")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+            vec!["dir".to_string()]
+        );
+        std::fs::remove_dir(hub.join("dir/.git")).unwrap();
+
+        // Once only removable content remains, the file lands.
         let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
         assert!(outcome.conflicts.is_empty());
         assert!(hub.join("dir").is_file());

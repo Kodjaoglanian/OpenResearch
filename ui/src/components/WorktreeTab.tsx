@@ -235,6 +235,7 @@ export function WorktreeTab({
         refreshing={loading}
         onRefresh={load}
       />
+      {liveWorktree && sessionId && <CodeTabNote>{m.worktree_sync_note()}</CodeTabNote>}
       {sessionId && (
         <details
           className="shrink-0 border-b border-border-variant px-3 py-2 text-sm"
