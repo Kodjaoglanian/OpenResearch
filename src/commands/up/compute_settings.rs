@@ -492,6 +492,12 @@ fn ssh_include_glob(pattern: &str) -> String {
     let mut in_class = false;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '\\' && !cfg!(windows) && !in_class
+            && let Some(literal) = chars.next()
+        {
+            result.push_str(&glob::Pattern::escape(&literal.to_string()));
+            continue;
+        }
         result.push(c);
         match c {
             '[' => in_class = true,
@@ -1751,6 +1757,18 @@ Host b
             (".ssh/conf.d/one/two/lab.conf", "Host two\n"),
         ]);
         assert_eq!(names(&ssh_hosts_in(home.path())), ["immediate", "one"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_include_globs_preserve_escaped_literal_characters() {
+        let home = fake_home(&[
+            (".ssh/config", r"Include conf.d/foo\#bar.conf conf.d/\*.conf"),
+            (".ssh/conf.d/foo#bar.conf", "Host hash\n"),
+            (".ssh/conf.d/*.conf", "Host literal\n"),
+            (".ssh/conf.d/other.conf", "Host other\n"),
+        ]);
+        assert_eq!(names(&ssh_hosts_in(home.path())), ["hash", "literal"]);
     }
 
     #[cfg(unix)]
