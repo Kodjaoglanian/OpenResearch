@@ -1125,7 +1125,8 @@ async fn run_local(
         dir.clone(),
         path.clone(),
         run_id.clone(),
-        done_rx,
+        done_rx.clone(),
+        0,
     ));
 
     let mut last_status = status_of(&stored)?;
@@ -1144,17 +1145,24 @@ async fn run_local(
         let status = stage_to_run_status(stage);
 
         if is_terminal_stage(stage) {
-            let _ = done_tx.send(true);
-            if tokio::time::timeout(Duration::from_secs(20), &mut log_task)
-                .await
-                .is_err()
-            {
-                log_task.abort();
-            }
+            let mut seen = 0;
             loop {
+                let _ = done_tx.send(true);
+                match tokio::time::timeout(Duration::from_secs(20), &mut log_task).await {
+                    Ok(Ok(offset)) => seen = offset,
+                    _ => log_task.abort(),
+                }
                 let tx = store.begin_immediate()?;
                 if !cancel_sent && local_cancel_requested(&store, &run_id) {
                     drop(tx);
+                    let _ = done_tx.send(false);
+                    log_task = tokio::spawn(tail_logs_local(
+                        dir.clone(),
+                        path.clone(),
+                        run_id.clone(),
+                        done_rx.clone(),
+                        seen,
+                    ));
                     cancel_local(&dir, &run_id, &mut cancel_sent);
                     if !cancel_sent {
                         tokio::time::sleep(POLL_INTERVAL).await;
@@ -1198,7 +1206,8 @@ async fn tail_logs_local(
     path: std::path::PathBuf,
     run_id: String,
     done: tokio::sync::watch::Receiver<bool>,
-) {
+    mut seen: u64,
+) -> u64 {
     let mut log = match RunLog::open(&path) {
         Ok(log) => log,
         Err(err) => {
@@ -1206,10 +1215,19 @@ async fn tail_logs_local(
                 "supervise {run_id}: could not open {}: {err}",
                 path.display()
             );
-            return;
+            return seen;
         }
     };
-    let mut seen = 0u64;
+    if seen > 0 {
+        if let Err(err) = log.file.seek(std::io::SeekFrom::End(0)) {
+            eprintln!(
+                "supervise {run_id}: could not resume {}: {err}",
+                path.display()
+            );
+            return seen;
+        }
+        log.replaying = true;
+    }
     loop {
         let draining = *done.borrow();
         let mut sink = |line: &str| log.line(line);
@@ -1225,7 +1243,7 @@ async fn tail_logs_local(
         };
         let _ = log.file.flush();
         if draining && drained {
-            return;
+            return seen;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1738,7 +1756,7 @@ mod tests {
 
         // A respawned supervisor with nothing to replay leaves the log alone.
         let (_tx, rx) = tokio::sync::watch::channel(true);
-        tail_logs_local(source.clone(), path.clone(), "run".into(), rx).await;
+        tail_logs_local(source.clone(), path.clone(), "run".into(), rx, 0).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
 
         // A record flushed mid-line stays whole, and the final drain keeps
@@ -1750,15 +1768,23 @@ mod tests {
             path.clone(),
             "run".into(),
             rx,
+            0,
         ));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
         std::fs::write(source.join("log"), "a\n{\"big\": 1}\nlast").unwrap();
         tx.send(true).unwrap();
-        running.await.unwrap();
+        let seen = running.await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "a\n{\"big\": 1}\nlast\n"
+        );
+        std::fs::write(source.join("log"), "a\n{\"big\": 1}\nlast\nshutdown\n").unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(true);
+        tail_logs_local(source, path.clone(), "run".into(), rx, seen).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a\n{\"big\": 1}\nlast\nshutdown\n"
         );
     }
 
