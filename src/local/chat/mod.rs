@@ -6550,7 +6550,7 @@ impl ChatHost {
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
         for side_chat in Store::open()?.side_chats_of(session_id)? {
-            let _ = Box::pin(self.delete_session(&side_chat)).await;
+            Box::pin(self.delete_session(&side_chat)).await?;
         }
         self.clear_queue(session_id)?;
         let _ = self.interrupt(session_id).await;

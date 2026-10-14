@@ -2704,10 +2704,12 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             }
             Act::Revert(rel) => match base_entry(target, base, rel)? {
                 None => {
-                    if remove_entry(&dest)? {
-                        outcome.deleted += 1;
-                        removed.insert(rel.clone());
+                    if !remove_entry(&dest)? {
+                        // Keep prior ownership when the user already deleted it.
+                        continue;
                     }
+                    outcome.deleted += 1;
+                    removed.insert(rel.clone());
                 }
                 // A submodule pin has no content to land.
                 Some(entry) if entry.mode == "160000" => {}
@@ -3084,6 +3086,15 @@ fn revert_tree_ok(
             if base_entry(target, base, &child)?.is_some_and(|e| e.mode == "160000") {
                 continue;
             }
+            return Ok(false);
+        }
+        if current == "dir"
+            && entries.get(rel).is_some_and(|fp| fp != "dir")
+            && ccur
+                != base_entry(target, base, &child)?
+                    .map(|e| e.fingerprint())
+                    .unwrap_or_default()
+        {
             return Ok(false);
         }
         if ccur.is_empty() || entries.get(&child).is_some_and(|fp| fp == &ccur) {
@@ -3900,6 +3911,17 @@ mod tests {
         );
 
         run(&wt, &["reset", "-q", "--hard", &base]);
+        std::fs::remove_file(hub.join("dir")).unwrap();
+        std::fs::create_dir(hub.join("dir")).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+                vec!["dir"]
+            );
+            assert_eq!(std::fs::read_dir(hub.join("dir")).unwrap().count(), 0);
+        }
+        std::fs::remove_dir(hub.join("dir")).unwrap();
+        write(&hub, "dir", "replacement\n");
         assert!(sync_worktree_changes(&wt, &base, &hub)
             .unwrap()
             .conflicts
@@ -3945,6 +3967,23 @@ mod tests {
             SyncOutcome::default()
         );
         assert!(!hub.join("code.txt").exists());
+        write(&wt, "new-code.txt", "session output\n");
+        assert_eq!(sync_worktree_changes(&wt, &base, &hub).unwrap().copied, 1);
+        std::fs::remove_file(hub.join("new-code.txt")).unwrap();
+        std::fs::remove_file(wt.join("new-code.txt")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome::default()
+        );
+        write(&wt, "new-code.txt", "session output\n");
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap(),
+            SyncOutcome {
+                conflicts: vec!["new-code.txt".into()],
+                ..Default::default()
+            }
+        );
+        assert!(!hub.join("new-code.txt").exists());
         run(
             &hub,
             &["worktree", "remove", "--force", &wt.to_string_lossy()],
@@ -4419,6 +4458,12 @@ mod tests {
             vec!["dir".to_string()]
         );
         std::fs::remove_dir(hub.join("dir/a.txt")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+            vec!["dir".to_string()]
+        );
+        std::fs::remove_dir(hub.join("dir")).unwrap();
+        write(&hub, "dir", "as file\n");
         let outcome = sync_worktree_changes(&wt, &base, &hub).unwrap();
         assert!(outcome.conflicts.is_empty());
         assert!(hub.join("dir").is_dir());

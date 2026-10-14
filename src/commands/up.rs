@@ -2859,6 +2859,14 @@ async fn session_storage(State(state): State<AppState>, Path(id): Path<String>) 
         let session = store
             .get_chat_session(&id)?
             .ok_or_else(|| not_found("chat session"))?;
+        let owner = store.chat_worktree_owner(&id)?;
+        let _owner_storage = if owner != id {
+            Some(state.chat.begin_worktree_sync(&owner).ok_or_else(|| {
+                bad_request("worktree owner deletion or another operation is in progress")
+            })?)
+        } else {
+            None
+        };
         let _admission = state
             .project_lifecycle
             .admit(&session.project_id)
@@ -2892,6 +2900,14 @@ async fn reveal_session_storage(
         let session = store
             .get_chat_session(&id)?
             .ok_or_else(|| not_found("chat session"))?;
+        let owner = store.chat_worktree_owner(&id)?;
+        let _owner_storage = if owner != id {
+            Some(state.chat.begin_worktree_sync(&owner).ok_or_else(|| {
+                bad_request("worktree owner deletion or another operation is in progress")
+            })?)
+        } else {
+            None
+        };
         let _admission = state
             .project_lifecycle
             .admit(&session.project_id)
@@ -8658,6 +8674,23 @@ mod tests {
 
     #[tokio::test]
     async fn storage_routes_refuse_concurrent_session_deletion() {
+        if std::env::var_os("ORX_STORAGE_LIFETIME_TEST_CHILD").is_none() {
+            let dir =
+                std::env::temp_dir().join(format!("orx-storage-lifetime-{}", uuid::Uuid::new_v4()));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "commands::up::tests::storage_routes_refuse_concurrent_session_deletion",
+                    "--nocapture",
+                ])
+                .env("ORX_STORAGE_LIFETIME_TEST_CHILD", "1")
+                .env("ORX_DATA_DIR", &dir)
+                .status()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(dir);
+            assert!(status.success());
+            return;
+        }
         let agent = Arc::new(AgentHost::new(None));
         let claude = Arc::new(local::claude::ClaudeHost::new());
         let state = AppState {
@@ -8685,7 +8718,7 @@ mod tests {
         let _deleting = state.chat.begin_session_delete("session").unwrap();
         let lookup = session_storage(State(state.clone()), Path("session".into())).await;
         let reveal = reveal_session_storage(
-            State(state),
+            State(state.clone()),
             Path("session".into()),
             Json(RevealSessionStorageReq {
                 location: SessionStorageLocation::Artifacts,
@@ -8697,6 +8730,62 @@ mod tests {
             assert_eq!(error.0, StatusCode::BAD_REQUEST);
             assert!(error.1.contains("session deletion"));
         }
+        drop(_deleting);
+
+        let store = Store::open().unwrap();
+        let mut session = StoredChatSession {
+            id: "owner".into(),
+            project_id: "project".into(),
+            harness: "codex".into(),
+            native_session_id: None,
+            title: None,
+            title_source: None,
+            model: None,
+            service_tier: None,
+            permission_mode: None,
+            plan_mode: false,
+            plan_reset_pending: false,
+            reasoning_level: None,
+            archived: false,
+            context_usage_json: None,
+            bootstrap_context: None,
+            goal: None,
+            autonomy: None,
+            active_leaf_id: None,
+            side_parent_session_id: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store.create_chat_session(&session).unwrap();
+        session.id = "side".into();
+        session.side_parent_session_id = Some("owner".into());
+        store.create_chat_session(&session).unwrap();
+
+        let deleting = state.chat.begin_session_delete("owner").unwrap();
+        let lookup = session_storage(State(state.clone()), Path("side".into())).await;
+        let reveal = reveal_session_storage(
+            State(state.clone()),
+            Path("side".into()),
+            Json(RevealSessionStorageReq {
+                location: SessionStorageLocation::Artifacts,
+            }),
+        )
+        .await;
+        for result in [lookup, reveal] {
+            let error = result.unwrap_err();
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("owner deletion"));
+        }
+        drop(deleting);
+
+        let storage = state.chat.begin_worktree_sync("side").unwrap();
+        assert!(state.chat.delete_session("owner").await.is_err());
+        assert!(store.get_chat_session("owner").unwrap().is_some());
+        assert!(store.get_chat_session("side").unwrap().is_some());
+        drop(storage);
+        state.chat.delete_session("owner").await.unwrap();
+        assert!(store.get_chat_session("owner").unwrap().is_none());
+        assert!(store.get_chat_session("side").unwrap().is_none());
     }
 
     #[test]
