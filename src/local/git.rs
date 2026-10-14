@@ -2492,14 +2492,11 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         // base's).
         if current == "dir" {
             return Ok(files_inside(dest, target)?.iter().all(|f| {
-                if f == rel {
-                    created_dirs.contains(rel)
-                        || removed
+                removals.contains(f.as_str())
+                    || ((f == rel || created_dirs.contains(f))
+                        && removed
                             .iter()
-                            .any(|path| path.starts_with(&format!("{rel}/")))
-                } else {
-                    removals.contains(f.as_str()) || created_dirs.contains(f)
-                }
+                            .any(|path| path.starts_with(&format!("{f}/"))))
             }));
         }
         Ok(current == desired
@@ -3830,6 +3827,11 @@ mod tests {
         run(&wt, &["rm", "-r", "-f", "-q", "p"]);
         write(&wt, "p", "file\n");
         run(&wt, &["add", "-A"]);
+        std::fs::remove_dir_all(hub.join("p")).unwrap();
+        std::fs::create_dir(hub.join("p")).unwrap();
+        assert_eq!(synced(&wt).conflicts, vec!["p".to_string()]);
+        assert!(hub.join("p").is_dir());
+        write(&hub, "p/a.txt", "a\n");
         assert!(synced(&wt).conflicts.is_empty());
         std::fs::remove_file(hub.join("p")).unwrap();
         std::fs::create_dir(hub.join("p")).unwrap();
@@ -3862,6 +3864,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(hub.join("dir/b")).unwrap(), "b\n");
 
         // History follows the worktree when its storage directory moves.
+        let manifest_path = git_dir(&hub).unwrap().join("orx-sync.json");
+        let mut legacy = SyncManifest::read(&manifest_path);
+        let key = wt.file_name().unwrap().to_string_lossy().into_owned();
+        let paths = legacy.sources.remove(&key).unwrap();
+        legacy
+            .sources
+            .insert(wt.to_string_lossy().into_owned(), paths);
+        if let Some(dirs) = legacy.created_dirs.remove(&key) {
+            legacy
+                .created_dirs
+                .insert(wt.to_string_lossy().into_owned(), dirs);
+        }
+        legacy.write(&manifest_path).unwrap();
         let moved = hub.with_file_name(format!(
             "{}-moved",
             hub.file_name().unwrap().to_string_lossy()
@@ -3883,6 +3898,12 @@ mod tests {
             std::fs::read_to_string(hub.join("linked.txt")).unwrap(),
             "agent again\n"
         );
+        assert!(SyncManifest::read(&manifest_path)
+            .sources
+            .contains_key(&key));
+        assert!(!SyncManifest::read(&manifest_path)
+            .sources
+            .contains_key(&wt.to_string_lossy().into_owned()));
 
         run(
             &hub,
