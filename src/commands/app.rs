@@ -846,7 +846,7 @@ mod imp {
         // Run after dashboard handlers; keep overlay dismissal, not WebKit's native fullscreen exit.
         let builder = builder
             .with_initialization_script("window.__ORX_MAC_TITLEBAR__ = true;")
-            .with_initialization_script(MACOS_ESCAPE_SCRIPT);
+            .with_initialization_script_for_main_only(MACOS_ESCAPE_SCRIPT, false);
         #[cfg(windows)]
         let builder = builder.with_initialization_script("window.__ORX_WIN_TITLEBAR__ = true;");
         #[cfg(not(target_os = "linux"))]

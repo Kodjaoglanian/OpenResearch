@@ -7,6 +7,11 @@ const source = readFileSync(new URL("../../src/commands/app.rs", import.meta.url
 const script = source.match(/const MACOS_ESCAPE_SCRIPT: &str = r#"([\s\S]*?)"#;/)?.[1];
 assert.ok(script, "the macOS webview installs an Escape handler");
 
+test("the Escape guard also reaches sandboxed preview frames", () => {
+  assert.match(source, /\.with_initialization_script_for_main_only\(MACOS_ESCAPE_SCRIPT, false\)/);
+  assert.match(source, /\.with_initialization_script\("window\.__ORX_MAC_TITLEBAR__ = true;"\)/);
+});
+
 function dispatch(key, { modal = false, popover = false, handled = false, modalSupported = true, popoverSupported = true, search = false, readOnly = false, disabled = false } = {}) {
   let listener;
   runInNewContext(script, {
