@@ -3065,10 +3065,14 @@ const Message = memo(function Message({
               autoFocus
               onChange={(e) => setEditDraft(e.target.value)}
               onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+                  e.stopPropagation();
+                  return;
+                }
                 if (e.key === "Escape") {
                   e.preventDefault();
                   setEditDraft(null);
-                } else if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                } else if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   submit();
                 }
@@ -7026,6 +7030,11 @@ export function ChatPanel({
                   composingRef.current = false;
                 }}
                 onKeyDown={(e) => {
+                  // WebKit can end composition before the confirming keydown (keyCode 229).
+                  if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+                    e.stopPropagation();
+                    return;
+                  }
                   if (skillMenuOpen) {
                     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                       e.preventDefault();
@@ -7046,7 +7055,7 @@ export function ChatPanel({
                       return;
                     }
                   }
-                  if (mentionMenuOpen && !e.nativeEvent.isComposing) {
+                  if (mentionMenuOpen) {
                     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                       e.preventDefault();
                       const delta = e.key === "ArrowDown" ? 1 : -1;
@@ -7077,7 +7086,7 @@ export function ChatPanel({
                     e.preventDefault();
                     return;
                   }
-                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
                     if (bashActive) {
                       void runShell();
