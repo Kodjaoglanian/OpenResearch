@@ -1560,7 +1560,7 @@ mod tests {
             let dir = temp.path().join("run");
             std::fs::create_dir(&dir).unwrap();
             let script = dir.join("run.sh");
-            std::fs::write(&script, "cd \"$(dirname \"$0\")\"; bash -c 'trap \"\" TERM; echo $$ > worker; while :; do sleep 0.1; done' & wait").unwrap();
+            std::fs::write(&script, "cd \"$(dirname \"$0\")\"; bash -c 'trap \"echo term > term-received\" TERM; echo $$ > worker; while :; do sleep 0.1; done' & wait").unwrap();
             let token = uuid::Uuid::new_v4().to_string();
             let mut launcher = std::process::Command::new("bash")
                 .arg(&script)
@@ -1612,7 +1612,34 @@ mod tests {
             if !late {
                 store.request_cancel(&run.id, "test").unwrap();
             }
-            let observer = Store::open_at(db).unwrap();
+            let observer = Store::open_at(db.clone()).unwrap();
+            let write_check = late.then(|| {
+                let term = dir.join("term-received");
+                let id = run.id.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        if term.exists() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    assert!(term.exists(), "cleanup must send TERM");
+                    let started = std::time::Instant::now();
+                    let writer = Store::open_at(db).unwrap();
+                    assert_eq!(writer.get_run(&id).unwrap().unwrap().status, "running");
+                    writer
+                        .set_result_markdown(&id, "write during TERM grace")
+                        .unwrap();
+                    assert!(
+                        started.elapsed() < Duration::from_secs(2),
+                        "cleanup must not hold the database lock"
+                    );
+                })
+            });
+            if late {
+                std::fs::write(dir.join("exit_code"), "137\n").unwrap();
+                assert_eq!(localbox::inspect_job(&dir).stage, "ERROR");
+            }
             let mut supervisor =
                 Box::pin(run_local(store, run.clone(), descriptor, run.id.clone()));
             if late {
@@ -1645,6 +1672,9 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .status();
             launcher.wait().unwrap();
+            if let Some(writer) = write_check {
+                writer.join().unwrap();
+            }
             assert_eq!(pending.status, "running");
             assert_eq!(pending.ended_at, None);
             completed.unwrap().unwrap().unwrap();

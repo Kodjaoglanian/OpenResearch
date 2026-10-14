@@ -410,7 +410,6 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
     #[cfg(target_os = "linux")]
     let run_dir = crate::paths::canonicalize(dir)?;
     let mut alive = false;
-    let mut leader_live = false;
     let mut owned = false;
     #[cfg(target_os = "linux")]
     for entry in std::fs::read_dir("/proc")? {
@@ -428,7 +427,6 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
         if fields.next() != Some(pid) || matches!(state, Some("Z" | "X")) {
             continue;
         }
-        leader_live |= entry.file_name() == pid;
         let command = match std::fs::read(path.join("cmdline")) {
             Ok(command) => command,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -478,7 +476,7 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
         }
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let mut fields = line.split_whitespace();
-            let member_pid = fields.next();
+            fields.next();
             if fields.next() != Some(pid)
                 || fields
                     .next()
@@ -487,7 +485,6 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
                 continue;
             }
             alive = true;
-            leader_live |= member_pid == Some(pid);
             owned |= fields.any(|field| token.as_deref() == Some(field))
                 || (token.is_none()
                     && script
@@ -496,8 +493,22 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
         }
     }
     if alive && !owned {
-        if leader_live && !run_alive(dir, pid) {
-            return Ok(false);
+        if let Some(script) = &script {
+            let output = std::process::Command::new("ps")
+                .args(["-ww", "-o", "stat=,command=", "-p", pid])
+                .output()?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            if output.status.success() {
+                if let Some((state, command)) = text.trim().split_once(char::is_whitespace) {
+                    if !state.starts_with(['Z', 'X'])
+                        && !command.trim().is_empty()
+                        && !command.ends_with("<defunct>")
+                        && !command_runs_script(command.trim(), script)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
         }
         // shortcut: unidentifiable legacy orphans need verified manual cleanup; new runs inherit tokens.
         return Err(anyhow!(
@@ -939,6 +950,28 @@ mod tests {
                 unowned_alive,
                 "missing identity must not signal unrelated work"
             );
+            for reaped in [false, true] {
+                let mut leader = std::process::Command::new("bash")
+                    .args(["-c", "trap '' TERM; sleep 60 & sleep 0.003"])
+                    .current_dir("/")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap();
+                std::fs::write(stale.join("pid"), leader.id().to_string()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if reaped {
+                    leader.wait().unwrap();
+                }
+                let cancelled = cancel_job(&stale);
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", leader.id())])
+                    .status();
+                leader.wait().unwrap();
+                assert!(
+                    cancelled.is_err(),
+                    "exited legacy leader must not prove reuse"
+                );
+            }
         }
 
         std::env::remove_var("ORX_DATA_DIR");
