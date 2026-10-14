@@ -2335,6 +2335,17 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         .get(&source_key)
         .cloned()
         .unwrap_or_default();
+    let other_synced_paths: std::collections::HashSet<String> = manifest
+        .sources
+        .iter()
+        .filter(|(key, _)| *key != &source_key)
+        .flat_map(|(_, paths)| {
+            paths
+                .iter()
+                .filter(|(_, fp)| !fp.is_empty())
+                .map(|(path, _)| path.clone())
+        })
+        .collect();
 
     let mut reverted_trees = Vec::new();
     for rel in entries.keys() {
@@ -2375,7 +2386,8 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
     let safe = |entries: &std::collections::BTreeMap<String, String>,
                 rel: &str,
                 dest: &Path,
-                desired: &str|
+                desired: &str,
+                removed: &std::collections::HashSet<String>|
      -> Result<bool> {
         // Every ancestor the write passes through must be a directory,
         // missing, or itself removed by this sync — a stray file there blocks
@@ -2396,26 +2408,38 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
         let current = fingerprint(dest);
         // A directory coming back from the base is checked per entry the
         // restore writes, not by the equality rules below.
-        if desired == "dir" {
+        if desired == "dir" && !current.is_empty() {
             return revert_tree_ok(entries, target, base, rel, &current);
         }
         // A submodule pin has no content to land: keep the checkout there.
         if desired == "gitlink" {
             return Ok(current == "dir" || current.is_empty());
         }
-        // Nothing at the destination means nothing to clobber — e.g. an
-        // emptied directory pruned by an earlier act in this same sync.
         if current.is_empty() {
-            return Ok(true);
+            return Ok(desired.is_empty()
+                || removed.contains(rel)
+                || match entries.get(rel) {
+                    Some(previous) => previous.is_empty(),
+                    None => {
+                        !other_synced_paths.contains(rel)
+                            && base_entry(target, base, rel)?.is_none()
+                    }
+                });
         }
         // A directory may only be replaced when everything it still holds is
         // itself being removed by this sync — fingerprint equality can never
         // stand in for that check ("dir" matches any directory, including the
         // base's).
         if current == "dir" {
-            return Ok(files_inside(dest, target)?
-                .iter()
-                .all(|f| f != rel && removals.contains(f.as_str())));
+            return Ok(files_inside(dest, target)?.iter().all(|f| {
+                if f == rel {
+                    removed
+                        .iter()
+                        .any(|path| path.starts_with(&format!("{rel}/")))
+                } else {
+                    removals.contains(f.as_str())
+                }
+            }));
         }
         Ok(current == desired
             || entries.get(rel).is_some_and(|fp| fp == &current)
@@ -2427,6 +2451,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
 
     let mut plan = Vec::with_capacity(acts.len());
     let mut conflicts = Vec::new();
+    let mut removed = std::collections::HashSet::new();
     for act in &acts {
         let rel = act.rel().to_string();
         let desired = match act {
@@ -2437,7 +2462,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                 .unwrap_or_default(),
         };
         let dest = safe_target_path(target, &rel)?;
-        if safe(&entries, &rel, &dest, &desired)? {
+        if safe(&entries, &rel, &dest, &desired, &removed)? {
             plan.push((act, rel, dest, desired));
         } else {
             conflicts.push(rel);
@@ -2455,7 +2480,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
     for (act, rel, dest, desired) in plan {
         // Re-check right before the write: an editor or another process racing
         // the scan still cannot be clobbered silently.
-        if !safe(&entries, &rel, &dest, &desired)? {
+        if !safe(&entries, &rel, &dest, &desired, &removed)? {
             return Err(anyhow!(
                 "the project folder changed {rel} during the sync — rerun it"
             ));
@@ -2525,9 +2550,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
             Act::Remove(rel) => {
                 if remove_entry(&dest)? {
                     outcome.deleted += 1;
-                    if let Some(parent) = dest.parent() {
-                        prune_empty_dirs(parent, target);
-                    }
+                    removed.insert(rel.clone());
                 }
                 entries.insert(rel.clone(), String::new());
             }
@@ -2535,9 +2558,7 @@ pub fn sync_worktree_changes(source: &Path, base: &str, target: &Path) -> Result
                 None => {
                     if remove_entry(&dest)? {
                         outcome.deleted += 1;
-                        if let Some(parent) = dest.parent() {
-                            prune_empty_dirs(parent, target);
-                        }
+                        removed.insert(rel.clone());
                     }
                 }
                 // A submodule pin has no content to land.
@@ -2823,20 +2844,6 @@ fn remove_entry(path: &Path) -> Result<bool> {
     }
     .map_err(|e| anyhow!("could not remove {}: {}", path.display(), e))?;
     Ok(true)
-}
-
-/// Remove emptied directories walking up from `dir` to `stop`, so a file
-/// replacing a directory can be written and no stale empty dirs remain.
-fn prune_empty_dirs(mut dir: &Path, stop: &Path) {
-    while dir != stop {
-        if std::fs::remove_dir(dir).is_err() {
-            break;
-        }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => break,
-        }
-    }
 }
 
 /// Every repo-relative file path inside the base's tree at `rel` — what
@@ -3576,6 +3583,26 @@ mod tests {
         assert_eq!(reverted.deleted, 1);
         assert!(reverted.conflicts.is_empty());
         assert!(!hub.join("untracked.txt").exists());
+
+        std::fs::create_dir_all(hub.join("results")).unwrap();
+        write(&wt, "results/output.pdf", "agent output\n");
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        std::fs::remove_file(wt.join("results/output.pdf")).unwrap();
+        assert!(sync_worktree_changes(&wt, &base, &hub)
+            .unwrap()
+            .conflicts
+            .is_empty());
+        assert!(hub.join("results").is_dir());
+        std::fs::remove_file(hub.join("seed.txt")).unwrap();
+        assert_eq!(
+            sync_worktree_changes(&wt, &base, &hub).unwrap().conflicts,
+            vec!["seed.txt".to_string()]
+        );
+        assert!(!hub.join("seed.txt").exists());
+        write(&hub, "seed.txt", "seed edited twice\n");
 
         // A hub-side edit to a path the worktree also changed blocks the sync
         // without touching the hub's copy.
