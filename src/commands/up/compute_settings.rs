@@ -448,7 +448,12 @@ fn expand_ssh_include(home: &std::path::Path, pattern: &str) -> Vec<std::path::P
         } else {
             return Vec::new();
         };
-        format!("{}/{rest}", glob::Pattern::escape(&home.to_string_lossy()))
+        let home = glob::Pattern::escape(&home.to_string_lossy());
+        if rest.is_empty() {
+            home
+        } else {
+            format!("{home}/{rest}")
+        }
     } else if Path::new(pattern).is_absolute() || pattern.starts_with(['/', '\\']) {
         pattern.to_string()
     } else {
@@ -457,14 +462,50 @@ fn expand_ssh_include(home: &std::path::Path, pattern: &str) -> Vec<std::path::P
             glob::Pattern::escape(&home.join(".ssh").to_string_lossy())
         )
     };
+    let pattern = ssh_include_glob(&pattern);
+    let Ok(matcher) = glob::Pattern::new(&pattern) else {
+        return Vec::new();
+    };
     let options = glob::MatchOptions {
         case_sensitive: !cfg!(windows),
         require_literal_separator: true,
         require_literal_leading_dot: true,
     };
-    glob::glob_with(&pattern, options)
-        .map(|paths| paths.flatten().collect())
+    // glob's directory filter drops even explicit dot patterns and panics on
+    // non-UTF-8 names. Apply the literal-dot rule to safe full-path matches.
+    let scan_options = glob::MatchOptions {
+        require_literal_leading_dot: false,
+        ..options
+    };
+    glob::glob_with(&pattern, scan_options)
+        .map(|paths| {
+            paths
+                .flatten()
+                .filter(|path| matcher.matches_path_with(path, options))
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+fn ssh_include_glob(pattern: &str) -> String {
+    let mut result = String::new();
+    let mut in_class = false;
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        result.push(c);
+        match c {
+            '[' => in_class = true,
+            ']' => in_class = false,
+            // OpenSSH glob has no recursive ** operator.
+            '*' if !in_class => {
+                while chars.peek() == Some(&'*') {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -1688,6 +1729,41 @@ Host b
             ["lab\"quote", "lab'quote"]
         );
         assert!(ssh_config_args("'unclosed path").is_empty());
+    }
+
+    #[test]
+    fn ssh_include_globs_match_explicit_dotfiles_only() {
+        let home = fake_home(&[
+            (".ssh/config", "Include conf.d/.lab*.conf conf.d/*.conf\n"),
+            (".ssh/conf.d/.lab1.conf", "Host hidden\n"),
+            (".ssh/conf.d/.private.conf", "Host private\n"),
+            (".ssh/conf.d/lab.conf", "Host public\n"),
+        ]);
+        assert_eq!(names(&ssh_hosts_in(home.path())), ["hidden", "public"]);
+    }
+
+    #[test]
+    fn ssh_include_double_stars_are_nonrecursive() {
+        let home = fake_home(&[
+            (".ssh/config", "Include conf.d/**.conf conf.d/**/lab.conf\n"),
+            (".ssh/conf.d/a.conf", "Host immediate\n"),
+            (".ssh/conf.d/one/lab.conf", "Host one\n"),
+            (".ssh/conf.d/one/two/lab.conf", "Host two\n"),
+        ]);
+        assert_eq!(names(&ssh_hosts_in(home.path())), ["immediate", "one"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_include_globs_skip_non_utf8_filenames_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+        let home = fake_home(&[
+            (".ssh/config", "Host direct\nInclude conf.d/*.conf\n"),
+            (".ssh/conf.d/lab.conf", "Host included\n"),
+        ]);
+        let name = std::ffi::OsString::from_vec(b"bad\xff.conf".to_vec());
+        std::fs::write(home.path().join(".ssh/conf.d").join(name), "Host bad\n").unwrap();
+        assert_eq!(names(&ssh_hosts_in(home.path())), ["direct", "included"]);
     }
 
     #[test]
