@@ -412,7 +412,7 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
     let mut alive = false;
     let mut owned = false;
     #[cfg(target_os = "linux")]
-    for entry in std::fs::read_dir("/proc")? {
+    'members: for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         let path = entry.path();
         let Ok(stat) = std::fs::read_to_string(path.join("stat")) else {
@@ -427,38 +427,51 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
         if fields.next() != Some(pid) || matches!(state, Some("Z" | "X")) {
             continue;
         }
-        let command = match std::fs::read(path.join("cmdline")) {
+        let identity = path.join(if token.is_some() {
+            "environ"
+        } else {
+            "cmdline"
+        });
+        let command = match std::fs::read(identity) {
             Ok(command) => command,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                for _ in 0..50 {
+                    let stat = match std::fs::read_to_string(path.join("stat")) {
+                        Ok(stat) => stat,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue 'members,
+                        Err(_) => return Err(error.into()),
+                    };
+                    let Some((_, fields)) = stat.rsplit_once(") ") else {
+                        return Err(error.into());
+                    };
+                    let mut fields = fields.split_whitespace();
+                    if matches!(fields.next(), Some("Z" | "X")) {
+                        continue 'members;
+                    }
+                    if fields
+                        .nth(5)
+                        .and_then(|flags| flags.parse::<u64>().ok())
+                        .is_some_and(|flags| flags & 4 != 0)
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+                return Err(error.into());
+            }
         };
-        owned |= token.is_none()
+        owned |= token.as_ref().is_some_and(|token| {
+            command
+                .split(|b| *b == 0)
+                .any(|arg| arg == token.as_bytes())
+        }) || (token.is_none()
             // Legacy snapshots retain their private cwd even after the launcher exits.
             && (std::fs::read_link(path.join("cwd")).is_ok_and(|cwd| cwd.starts_with(&run_dir))
                 || script.as_ref().is_some_and(|script| {
-                    command
-                        .split(|b| *b == 0)
-                        .any(|arg| arg == script.as_bytes())
-                }));
-        if let Some(token) = &token {
-            match std::fs::read(path.join("environ")) {
-                Ok(env) => owned |= env.split(|b| *b == 0).any(|v| v == token.as_bytes()),
-                Err(error) => {
-                    let still_live =
-                        std::fs::read_to_string(path.join("stat"))
-                            .ok()
-                            .is_some_and(|stat| {
-                                stat.rsplit_once(") ")
-                                    .and_then(|(_, fields)| fields.split_whitespace().next())
-                                    .is_some_and(|state| !matches!(state, "Z" | "X"))
-                            });
-                    if still_live {
-                        return Err(error.into());
-                    }
-                    continue;
-                }
-            }
-        }
+                    command.split(|b| *b == 0).any(|arg| arg == script.as_bytes())
+                })));
         alive = true;
     }
     #[cfg(not(target_os = "linux"))]
