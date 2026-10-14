@@ -439,13 +439,16 @@ fn ssh_config_args(value: &str) -> Vec<String> {
 /// Relative Include paths are under `~/.ssh`, even in nested files.
 fn expand_ssh_include(home: &std::path::Path, pattern: &str) -> Vec<std::path::PathBuf> {
     use std::path::Path;
-    let pattern = if let Some(rest) = pattern
-        .strip_prefix("~/")
-        .or_else(|| pattern.strip_prefix("~\\"))
-    {
+    let pattern = if let Some(rest) = pattern.strip_prefix('~') {
+        let (user, rest) = rest.split_once(['/', '\\']).unwrap_or((rest, ""));
+        let home = if user.is_empty() {
+            home.to_path_buf()
+        } else if let Some(home) = ssh_user_home(user) {
+            home
+        } else {
+            return Vec::new();
+        };
         format!("{}/{rest}", glob::Pattern::escape(&home.to_string_lossy()))
-    } else if pattern == "~" {
-        glob::Pattern::escape(&home.to_string_lossy())
     } else if Path::new(pattern).is_absolute() || pattern.starts_with(['/', '\\']) {
         pattern.to_string()
     } else {
@@ -462,6 +465,65 @@ fn expand_ssh_include(home: &std::path::Path, pattern: &str) -> Vec<std::path::P
     glob::glob_with(&pattern, options)
         .map(|paths| paths.flatten().collect())
         .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn ssh_user_home(user: &str) -> Option<std::path::PathBuf> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let user = CString::new(user).ok()?;
+    let mut buffer = vec![0u8; 16384];
+    loop {
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut result = std::ptr::null_mut();
+        // SAFETY: the input and writable buffers remain valid throughout the call.
+        let error = unsafe {
+            libc::getpwnam_r(
+                user.as_ptr(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if error == libc::ERANGE && buffer.len() < 1024 * 1024 {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if error != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: success initializes the entry and its string lives in buffer.
+        let directory = unsafe { CStr::from_ptr(entry.assume_init().pw_dir) };
+        return Some(OsStr::from_bytes(directory.to_bytes()).into());
+    }
+}
+
+#[cfg(windows)]
+fn ssh_user_home(user: &str) -> Option<std::path::PathBuf> {
+    use std::os::windows::process::CommandExt;
+
+    // OpenSSH resolves the account SID's ProfileImagePath, not a guessed folder.
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$sid = [Security.Principal.NTAccount]::new($env:ORX_SSH_CONFIG_USER).Translate([Security.Principal.SecurityIdentifier]).Value
+$path = [Microsoft.Win32.Registry]::GetValue('HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\' + $sid, 'ProfileImagePath', $null)
+if (!$path) { $path = $env:SystemRoot }
+[Environment]::ExpandEnvironmentVariables($path)
+"#;
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("ORX_SSH_CONFIG_USER", user)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = std::str::from_utf8(&output.stdout).ok()?.trim();
+    (!path.is_empty()).then(|| path.into())
 }
 
 pub(super) async fn ssh_settings() -> ApiResult {
@@ -1584,6 +1646,35 @@ Host b
             names(&ssh_hosts_in(home.path())),
             ["quoted", "escaped", "apostrophe"]
         );
+    }
+
+    #[test]
+    fn ssh_includes_expand_named_user_homes() {
+        #[cfg(windows)]
+        let user = std::env::var("USERNAME").unwrap();
+        #[cfg(unix)]
+        let user = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let actual_home = ssh_user_home(&user).unwrap();
+        assert!(actual_home.is_dir());
+        let fake_home = fake_home(&[(".ssh/config", "")]);
+        assert_eq!(
+            expand_ssh_include(fake_home.path(), &format!("~{user}")),
+            [actual_home]
+        );
+        assert!(expand_ssh_include(
+            fake_home.path(),
+            &format!("~orx-missing-{}/config", uuid::Uuid::new_v4()),
+        )
+        .is_empty());
     }
 
     #[test]
