@@ -26,8 +26,8 @@ function dispatch(key, { modal = false, popover = false, handled = false, modalS
     },
     document: {
       querySelector(selector) {
-        if (selector === "dialog:modal") {
-          if (!modalSupported) throw new SyntaxError("unsupported :modal");
+        if (selector === "dialog:modal" || selector === "dialog[open]") {
+          if (selector === "dialog:modal" && !modalSupported) throw new SyntaxError("unsupported :modal");
           return modal ? {} : null;
         }
         assert.equal(selector, "[popover]:popover-open:not([popover=manual])");
@@ -95,4 +95,8 @@ test("older WebKit without either optional selector still prevents idle Escape",
 
 test("modal cancellation is preserved when popover selectors are unavailable", () => {
   assert.equal(dispatch("Escape", { modal: true, popoverSupported: false }), false);
+});
+
+test("WebKit with native dialogs but no :modal keeps Escape-to-cancel", () => {
+  assert.equal(dispatch("Escape", { modal: true, modalSupported: false, popoverSupported: false }), false);
 });

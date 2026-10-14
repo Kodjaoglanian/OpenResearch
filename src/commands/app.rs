@@ -610,7 +610,8 @@ mod imp {
         window.addEventListener("keydown", (event) => {
             if (event.key !== "Escape" || event.defaultPrevented) return;
             if (event.target?.matches?.("input[type=search]:enabled:not([readonly])")) return;
-            if (CSS.supports("selector(:modal)") && document.querySelector("dialog:modal")) return;
+            // shortcut: old WebKit treats open dialogs as modal; revisit if non-modal dialogs are added.
+            if (document.querySelector(CSS.supports("selector(:modal)") ? "dialog:modal" : "dialog[open]")) return;
             if (CSS.supports("selector(:popover-open)") && document.querySelector("[popover]:popover-open:not([popover=manual])")) return;
             event.preventDefault();
         });
