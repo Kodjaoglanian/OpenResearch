@@ -396,15 +396,17 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
     if !pid.parse::<u32>().is_ok_and(|pid| pid > 0) {
         return Err(anyhow!("Invalid local process group {pid}"));
     }
-    let token = std::fs::read_to_string(dir.join("process_token"))
-        .ok()
-        .map(|token| format!("ORX_LOCAL_RUN_TOKEN={token}"));
+    let token = match std::fs::read_to_string(dir.join("process_token")) {
+        Ok(token) => Some(format!("ORX_LOCAL_RUN_TOKEN={token}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let script = std::fs::read_to_string(dir.join("pid_script")).ok();
     #[cfg(target_os = "linux")]
     let run_dir = crate::paths::canonicalize(dir)?;
     let mut alive = false;
     let mut leader_live = false;
-    let mut owned = token.is_none() && script.is_none();
+    let mut owned = false;
     #[cfg(target_os = "linux")]
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
@@ -476,16 +478,15 @@ fn group_alive(dir: &Path, pid: &str) -> Result<bool> {
             }
             alive = true;
             leader_live |= member_pid == Some(pid);
-            owned |= fields.any(|field| {
-                token.as_deref() == Some(field)
-                    || (token.is_none() && script.as_deref() == Some(field))
-            });
+            owned |= fields.any(|field| token.as_deref() == Some(field))
+                || (token.is_none() && script.as_ref().is_some_and(|script| line.contains(script)));
         }
     }
     if alive && !owned {
         if leader_live && !run_alive(dir, pid) {
             return Ok(false);
         }
+        // shortcut: unidentifiable legacy orphans need verified manual cleanup; new runs inherit tokens.
         return Err(anyhow!(
             "Could not verify ownership of local process group {pid}"
         ));
@@ -663,7 +664,10 @@ mod tests {
     #[test]
     fn local_job_lifecycle() {
         // The only test that touches ORX_DATA_DIR, so the global env is safe.
-        let base = std::env::temp_dir().join(format!("orx-localbox-test-{}", uuid::Uuid::new_v4()));
+        let base = std::env::temp_dir().join(format!(
+            "orx-localbox-test-{} with spaces",
+            uuid::Uuid::new_v4()
+        ));
         std::env::set_var("ORX_DATA_DIR", &base);
 
         let dir = run_job(&LocalJobSpec {
@@ -791,7 +795,7 @@ mod tests {
         }
 
         #[cfg(unix)]
-        for dead_leader in 0..if cfg!(target_os = "linux") { 6 } else { 3 } {
+        for dead_leader in 0..if cfg!(target_os = "linux") { 6 } else { 4 } {
             let resistant = run_job(&LocalJobSpec {
                 run_id: format!("term-resistant-{dead_leader}"),
                 script: "bash -c 'trap \"\" TERM; echo $$ > worker-pid; while :; do echo tick >> heartbeat; sleep 0.1; done' & wait".into(),
