@@ -3064,7 +3064,10 @@ const Message = memo(function Message({
               autoFocus
               onChange={(e) => setEditDraft(e.target.value)}
               onKeyDown={(e) => {
-                if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+                if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+                  e.stopPropagation();
+                  return;
+                }
                 if (e.key === "Escape") {
                   e.preventDefault();
                   setEditDraft(null);
@@ -7001,7 +7004,10 @@ export function ChatPanel({
                 }}
                 onKeyDown={(e) => {
                   // WebKit can end composition before the confirming keydown (keyCode 229).
-                  if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+                  if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+                    e.stopPropagation();
+                    return;
+                  }
                   if (skillMenuOpen) {
                     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
                       e.preventDefault();
