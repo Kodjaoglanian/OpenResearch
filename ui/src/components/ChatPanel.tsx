@@ -80,6 +80,7 @@ import {
   useState,
   type MouseEvent as ReactMouseEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { BrandMark } from "./Wordmark";
 import {
   type SidebarChatCursor,
@@ -4035,12 +4036,32 @@ function SessionRow({
   onSetArchived: (archived: boolean) => void;
   onDelete: () => void;
 }) {
-  const { open, setOpen, ref } = usePopover();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const { open, setOpen, ref } = usePopover(triggerRef);
   const title = session.title?.trim() || "Untitled";
   const [editing, setEditing] = useState(false);
   // Seeded by startEditing() before the input mounts; "" is just a placeholder.
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useLayoutEffect(() => {
+    if (!open || !ref.current || !triggerRef.current) return;
+    const anchor = triggerRef.current.getBoundingClientRect();
+    const bounds = ref.current.getBoundingClientRect();
+    const left = getComputedStyle(triggerRef.current).direction === "rtl" ? anchor.left : anchor.right - bounds.width;
+    ref.current.style.left = `${Math.max(8, Math.min(left, window.innerWidth - bounds.width - 8))}px`;
+    ref.current.style.top = `${Math.max(8, Math.min(anchor.bottom + 4, window.innerHeight - bounds.height - 8))}px`;
+    const dismiss = (event: Event) => {
+      if (event.target instanceof Node && ref.current?.contains(event.target)) return;
+      setOpen(false);
+    };
+    window.addEventListener("scroll", dismiss, true);
+    window.addEventListener("resize", dismiss);
+    return () => {
+      window.removeEventListener("scroll", dismiss, true);
+      window.removeEventListener("resize", dismiss);
+    };
+  }, [open, ref, setOpen]);
 
   function startEditing() {
     setDraft(session.title?.trim() || "");
@@ -4064,7 +4085,6 @@ function SessionRow({
   // Not a <button>: the kebab is a real button and can't nest inside one.
   return (
     <div
-      ref={ref}
       role="button"
       tabIndex={0}
       className={`session-row relative flex items-center gap-2 w-full text-start py-[7px] ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-visible]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-visible)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-primary [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-primary [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-[5px] [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-primary [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""}  ${
@@ -4130,9 +4150,11 @@ function SessionRow({
         )}
       </span>
       <button
+        ref={triggerRef}
         className="session-menu-btn"
         title={m.chat_panel_session_options()}
         aria-label={m.chat_panel_session_options()}
+        aria-expanded={open}
         onClick={(e) => {
           e.stopPropagation();
           setOpen((v) => !v);
@@ -4140,8 +4162,8 @@ function SessionRow({
       >
         <MoreHorizontal size={14} />
       </button>
-      {open && (
-        <div className="option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 drop-down session-menu">
+      {open && createPortal(
+        <div ref={ref} className="option-menu session-menu fixed z-70 flex flex-col max-h-[calc(100vh-1rem)] overflow-y-auto min-w-35 rounded-lg border border-border bg-background p-1.5 shadow-menu">
           <MenuItem
             onClick={(e) => {
               e.stopPropagation();
@@ -4169,7 +4191,7 @@ function SessionRow({
           >
             <span>{m.chat_panel_delete()}</span>
           </MenuItem>
-        </div>
+        </div>, document.body,
       )}
     </div>
   );
