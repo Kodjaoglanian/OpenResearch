@@ -7,7 +7,7 @@ const source = readFileSync(new URL("../../src/commands/app.rs", import.meta.url
 const script = source.match(/const MACOS_ESCAPE_SCRIPT: &str = r#"([\s\S]*?)"#;/)?.[1];
 assert.ok(script, "the macOS webview installs an Escape handler");
 
-function dispatch(key, { modal = false, popover = false, handled = false } = {}) {
+function dispatch(key, { modal = false, popover = false, handled = false, modalSupported = true, popoverSupported = true } = {}) {
   let listener;
   runInNewContext(script, {
     window: {
@@ -17,10 +17,22 @@ function dispatch(key, { modal = false, popover = false, handled = false } = {})
         listener = handler;
       },
     },
+    CSS: {
+      supports(selector) {
+        if (selector === "selector(:modal)") return modalSupported;
+        assert.equal(selector, "selector(:popover-open)");
+        return popoverSupported;
+      },
+    },
     document: {
       querySelector(selector) {
-        assert.equal(selector, "dialog:modal, [popover]:popover-open:not([popover=manual])");
-        return modal || (popover && popover !== "manual") ? {} : null;
+        if (selector === "dialog:modal") {
+          if (!modalSupported) throw new SyntaxError("unsupported :modal");
+          return modal ? {} : null;
+        }
+        assert.equal(selector, "[popover]:popover-open:not([popover=manual])");
+        if (!popoverSupported) throw new SyntaxError("unsupported :popover-open");
+        return popover && popover !== "manual" ? {} : null;
       },
     },
   });
@@ -56,4 +68,16 @@ test("manual tooltips do not enable native fullscreen exit", () => {
 test("other keyboard defaults remain intact", () => {
   assert.equal(dispatch("Enter"), false);
   assert.equal(dispatch("f"), false);
+});
+
+test("older WebKit without popover selectors still prevents idle Escape", () => {
+  assert.equal(dispatch("Escape", { popoverSupported: false }), true);
+});
+
+test("older WebKit without either optional selector still prevents idle Escape", () => {
+  assert.equal(dispatch("Escape", { modalSupported: false, popoverSupported: false }), true);
+});
+
+test("modal cancellation is preserved when popover selectors are unavailable", () => {
+  assert.equal(dispatch("Escape", { modal: true, popoverSupported: false }), false);
 });
