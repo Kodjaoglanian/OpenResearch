@@ -61,12 +61,6 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     #[cfg(windows)]
     let prelude = python::prelude(&dir)
         .map_err(|e| anyhow!("Could not set up Python for {}: {}", dir.display(), e))?;
-    #[cfg(windows)]
-    // CMD switches and its command string are not POSIX paths for MSYS to convert.
-    let prelude = format!(
-        "cmd() {{ MSYS2_ARG_CONV_EXCL='*' command cmd \"$@\"; }}\n\
-         cmd.exe() {{ MSYS2_ARG_CONV_EXCL='*' command cmd.exe \"$@\"; }}\n{prelude}"
-    );
     #[cfg(not(windows))]
     let record_exit = "";
     #[cfg(windows)]
@@ -581,14 +575,30 @@ mod tests {
         assert_reaped(&failed);
 
         #[cfg(windows)]
-        for program in ["cmd", "cmd.exe"] {
+        for (index, program) in [
+            "cmd".to_string(),
+            "cmd.exe".to_string(),
+            "CMD".to_string(),
+            "CMD.EXE".to_string(),
+            "cMd.ExE".to_string(),
+            "\"$COMSPEC\"".to_string(),
+            "\"${COMSPEC}\"".to_string(),
+            sh_quote(&std::env::var("COMSPEC").unwrap().replace('\\', "/")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             for code in [0, 7] {
+                let command = crate::local::bash::local_run_command(&format!(
+                    "{program} /c run_validation.cmd"
+                ))
+                .into_owned();
                 let batch = run_job(&LocalJobSpec {
-                    run_id: format!("batch-{program}-{code}"),
+                    run_id: format!("batch-{index}-{code}"),
                     script: format!(
                         "unset MSYS2_ARG_CONV_EXCL\nmkdir repo; cd repo\n\
                          printf '%s\\r\\n' '@echo off' 'echo batch-output' 'echo batch-result>result.txt' 'exit /b {code}' > run_validation.cmd\n\
-                         {program} /c run_validation.cmd\n\
+                         {command}\n\
                          code=$?\n[ -z \"${{MSYS2_ARG_CONV_EXCL+x}}\" ] || exit 99\nexit \"$code\""
                     ),
                     env: HashMap::new(),
