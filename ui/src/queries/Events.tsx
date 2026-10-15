@@ -76,7 +76,7 @@ export function QueryEvents() {
     const refreshSidebar = () => {
       sidebarTimer ??= setTimeout(() => {
         sidebarTimer = undefined;
-        invalidateFamilies(["listSidebarChatSessions"], scope);
+        invalidateFamilies(["listSidebarChatSessions", "listChatSessions"], scope);
       }, 100);
     };
     const refreshActivity = () => {
