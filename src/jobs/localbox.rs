@@ -584,6 +584,7 @@ mod tests {
             "\"$COMSPEC\"".to_string(),
             "\"${COMSPEC}\"".to_string(),
             sh_quote(&std::env::var("COMSPEC").unwrap().replace('\\', "/")),
+            "\n\tcmd".to_string(),
         ]
         .into_iter()
         .enumerate()

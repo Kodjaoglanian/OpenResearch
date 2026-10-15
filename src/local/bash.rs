@@ -19,13 +19,19 @@ pub fn local_run_command(command: &str) -> std::borrow::Cow<'_, str> {
             },
             _ => head.split_whitespace().next().unwrap_or_default(),
         };
+        if !head.starts_with(['\'', '"'])
+            && executable.contains(['=', ';', '&', '|', '<', '>', '(', ')', '`'])
+        {
+            return command.into();
+        }
         let executable = executable.rsplit(['/', '\\']).next().unwrap_or_default();
         if executable.eq_ignore_ascii_case("cmd")
             || executable.eq_ignore_ascii_case("cmd.exe")
             || matches!(executable, "$COMSPEC" | "${COMSPEC}")
         {
             // CMD switches and command text are not POSIX paths for MSYS to convert.
-            return format!("MSYS2_ARG_CONV_EXCL='*' {command}").into();
+            let leading = &command[..command.len() - head.len()];
+            return format!("{leading}MSYS2_ARG_CONV_EXCL='*' {head}").into();
         }
     }
     command.into()
@@ -171,9 +177,15 @@ mod tests {
             "bash -c 'cmd /c run_validation.cmd'",
             "'cmd'helper /c/data",
             "\"cmd.exe\"helper /c/data",
+            "OUT_DIR=./cmd python script.py /c/data",
+            "echo;/tmp/cmd /c/data",
         ] {
             assert_eq!(local_run_command(command), command);
         }
+        assert_eq!(
+            local_run_command("\n\tcmd /c run_validation.cmd"),
+            "\n\tMSYS2_ARG_CONV_EXCL='*' cmd /c run_validation.cmd"
+        );
     }
 
     #[test]
