@@ -5280,12 +5280,12 @@ export function ChatPanel({
     const waiting = new Set<string>();
     for (const [id, messages] of Object.entries(state.messagesBySession)) {
       const busy = state.busySessions.has(id);
-      if (hasPendingInput(messages, busy)) waiting.add(id);
+      if (hasPendingInput(activePath(messages, state.activeLeafBySession[id]), busy)) waiting.add(id);
     }
     return waiting;
-  }, [state.busySessions, state.messagesBySession]);
+  }, [state.busySessions, state.messagesBySession, state.activeLeafBySession]);
   // Async questions can await an answer while the agent continues working.
-  const awaitingInput = busy && allMessages.some((message) => message.parts.some(
+  const awaitingInput = busy && messages.some((message) => message.parts.some(
     (part) => part.type === "prompt" && part.prompt && !part.prompt.resolved && part.prompt.nativeId,
   ));
   const activeSession = openSession;
