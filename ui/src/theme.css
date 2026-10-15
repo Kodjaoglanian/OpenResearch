@@ -190,8 +190,8 @@
   --term-app-ansi-bright-cyan: #209a84;
   --term-app-ansi-bright-white: #171717;
   --tool-shimmer: color-mix(in srgb, var(--text) 58%, var(--subtext));
-  /* Translucent: the editor's selection sits above the highlighted text, and Firefox won't blend an opaque one. */
-  --editor-selection: color-mix(in srgb, var(--selection-text) 12%, transparent);
+  /* Sits above the highlighted text, so translucent; composites to --selection-background over --base. */
+  --editor-selection: rgb(22 22 22 / 12%);
   /* Shared reading width for chat, markdown, and plan surfaces. */
   --readable-col: 840px;
   --border-strong: var(--border);
@@ -228,7 +228,7 @@
   --selection-background: #606060;
   --selection-text: #ffffff;
   --code-selection: var(--selection-background);
-  --editor-selection: color-mix(in srgb, var(--selection-text) 32%, transparent);
+  --editor-selection: rgb(255 255 255 / 32%);
   --text: #e5e5e5;
   --subtext: #a3a3a3;
   --muted: #737373;
