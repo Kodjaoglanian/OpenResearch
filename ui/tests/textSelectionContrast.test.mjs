@@ -38,6 +38,8 @@ function hexToken(css, name) {
   return match[1];
 }
 
+const rgb = (hex) => hex.slice(1).match(/.{2}/g).map((channel) => Number.parseInt(channel, 16));
+
 function luminance(hex) {
   const channels = hex
     .slice(1)
@@ -83,12 +85,16 @@ test("editor selection tints the highlighted overlay instead of redrawing its te
   });
   for (const { name, css } of themeTokens()) {
     const tint = css.match(/--editor-selection: rgb\((\d+) (\d+) (\d+) \/ (\d+)%\)/);
-    assert.ok(tint, `${name} editor selection must be a translucent rgb()`);
-    const [base, target] = ["base", "selection-background"].map((token) => hexToken(css, token));
-    const channel = (hex, i) => Number.parseInt(hex.slice(1 + i * 2, 3 + i * 2), 16);
+    assert.ok(tint, `${name} editor selection must be a translucent rgb() (no color-mix on macOS 11 WebKit)`);
+    const alpha = Number(tint[4]) / 100;
+    const backdrop = rgb(hexToken(css, "base"));
+    const target = rgb(hexToken(css, "selection-background"));
     for (let i = 0; i < 3; i++) {
-      const composite = channel(base, i) + (Number(tint[i + 1]) - channel(base, i)) * (Number(tint[4]) / 100);
-      assert.ok(Math.abs(composite - channel(target, i)) <= 6, `${name} editor selection drifts from --selection-background`);
+      const composite = backdrop[i] + (Number(tint[i + 1]) - backdrop[i]) * alpha;
+      assert.ok(
+        Math.abs(composite - target[i]) <= 6,
+        `${name} editor selection composites to ${composite.toFixed(0)}, not ${target[i]}`,
+      );
     }
   }
 });
