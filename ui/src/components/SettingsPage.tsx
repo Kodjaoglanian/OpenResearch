@@ -78,6 +78,7 @@ import {
   type DataDirSettings,
   type DataDirValidation,
   rayPreflight,
+  trackioPreflight,
   runDisplayStatus,
   timeAgo,
   type ComputeSettings,
@@ -98,6 +99,7 @@ import {
   type LocalMachine,
   type ModalSettings,
   type RayPreflight,
+  type TrackioPreflight,
   type RaySettings,
   type Run,
   type SlurmPreflight,
@@ -1416,7 +1418,7 @@ function RaySection() {
               >
                 {m.settings_page_test_connection()}
               </Button>
-              <RayTestBadge test={test} />
+              <PreflightBadge test={test} />
             </div>
             {preflight?.reachable && preflight.rayVersion && (
               <p className="m-0 text-sm text-subtext">
@@ -1430,7 +1432,7 @@ function RaySection() {
   );
 }
 
-function RayTestBadge({ test }: { test: "testing" | RayPreflight | null }) {
+function PreflightBadge({ test }: { test: "testing" | { reachable: boolean } | null }) {
   if (test === null) return null;
   if (test === "testing") return <Badge>{m.settings_page_testing()}</Badge>;
   if (test.reachable) return <Badge variant="success">{m.settings_page_reachable()}</Badge>;
@@ -2532,8 +2534,11 @@ function EnvVarsSection() {
   const varsOptions = getEnvVarsQuery();
   const varsQuery = useQuery(varsOptions);
   const vars = varsQuery.data ?? null;
+  // Bumped on every save or delete so an old Trackio check never describes new settings.
+  const [revision, setRevision] = useState(0);
   const setVars = (value: React.SetStateAction<EnvVar[] | null>) => {
     setScopedQueryData(varsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
+    setRevision((n) => n + 1);
   };
   const loadError = vars ? null : varsQuery.error?.message ?? null;
   const [adding, setAdding] = useState(false);
@@ -2580,8 +2585,42 @@ function EnvVarsSection() {
             </tbody>
           </table>
         )}
+        {vars?.some((v) => v.key === "TRACKIO_SERVER_URL") && <TrackioCheck key={revision} />}
       </div>
     </>
+  );
+}
+
+function TrackioCheck() {
+  const [test, setTest] = useState<"testing" | TrackioPreflight | null>(null);
+
+  async function runPreflight() {
+    setTest("testing");
+    try {
+      setTest(await trackioPreflight());
+    } catch (err) {
+      setTest({ reachable: false, version: null, writeAccess: null, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  const result = test === null || test === "testing" ? null : test;
+  return (
+    <div className="mt-3">
+      <div className="actions">
+        <Button type="button" size="small" onClick={() => void runPreflight()} disabled={test === "testing"}>
+          {m.settings_trackio_test()}
+        </Button>
+        <PreflightBadge test={test} />
+      </div>
+      {result?.error && <p className={COMPUTE_DIAGNOSTIC_CLASS_NAME}>{result.error}</p>}
+      {result?.version && (
+        <p className="m-0 mt-2 text-sm text-subtext">
+          {m.settings_trackio_version({ version: ltr(result.version) })}
+          {result.writeAccess === true && <> · {m.settings_trackio_write_ok()}</>}
+          {result.writeAccess === false && <> · {m.settings_trackio_write_rejected()}</>}
+        </p>
+      )}
+    </div>
   );
 }
 
