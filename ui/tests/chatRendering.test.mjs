@@ -222,3 +222,15 @@ test("export file names are safe slugs", () => {
   // Trimmed after the cut, so a title severed at a separator keeps a clean name.
   assert.equal(transcriptFileName(`${"a".repeat(79)} tail`), `${"a".repeat(79)}.md`);
 });
+
+test("pending input outlives async turns but held prompts require a live turn", async () => {
+  const { hasPendingInput } = await import("../src/chatRendering.ts");
+  const question = { id: "q", type: "prompt", prompt: { kind: "question", resolved: false } };
+  assert.equal(hasPendingInput([message(question)], false), true);
+  assert.equal(hasPendingInput([message(question)], true), true);
+  const held = { ...question, prompt: { ...question.prompt, nativeId: "rpc-1" } };
+  assert.equal(hasPendingInput([message(held)], false), false);
+  assert.equal(hasPendingInput([message(held)], true), true);
+  assert.equal(hasPendingInput([message({ ...question, prompt: { ...question.prompt, resolved: true } })], true), false);
+  assert.equal(hasPendingInput([message({ id: "plan", type: "prompt", prompt: { kind: "plan", resolved: false } })], false), false);
+});
