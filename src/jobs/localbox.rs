@@ -61,6 +61,12 @@ pub fn run_job(spec: &LocalJobSpec) -> Result<PathBuf> {
     #[cfg(windows)]
     let prelude = python::prelude(&dir)
         .map_err(|e| anyhow!("Could not set up Python for {}: {}", dir.display(), e))?;
+    #[cfg(windows)]
+    // CMD switches and its command string are not POSIX paths for MSYS to convert.
+    let prelude = format!(
+        "cmd() {{ MSYS2_ARG_CONV_EXCL='*' command cmd \"$@\"; }}\n\
+         cmd.exe() {{ MSYS2_ARG_CONV_EXCL='*' command cmd.exe \"$@\"; }}\n{prelude}"
+    );
     #[cfg(not(windows))]
     let record_exit = "";
     #[cfg(windows)]
@@ -573,6 +579,43 @@ mod tests {
 
         #[cfg(unix)]
         assert_reaped(&failed);
+
+        #[cfg(windows)]
+        for program in ["cmd", "cmd.exe"] {
+            for code in [0, 7] {
+                let batch = run_job(&LocalJobSpec {
+                    run_id: format!("batch-{program}-{code}"),
+                    script: format!(
+                        "unset MSYS2_ARG_CONV_EXCL\nmkdir repo; cd repo\n\
+                         printf '%s\\r\\n' '@echo off' 'echo batch-output' 'echo batch-result>result.txt' 'exit /b {code}' > run_validation.cmd\n\
+                         {program} /c run_validation.cmd\n\
+                         code=$?\n[ -z \"${{MSYS2_ARG_CONV_EXCL+x}}\" ] || exit 99\nexit \"$code\""
+                    ),
+                    env: HashMap::new(),
+                    secret_env: HashMap::new(),
+                })
+                .unwrap();
+                let state = wait_terminal(&batch);
+                assert_eq!(
+                    state.stage,
+                    if code == 0 { "COMPLETED" } else { "ERROR" },
+                    "{program}: {:?}",
+                    state.message
+                );
+                assert_eq!(
+                    state.message,
+                    (code != 0).then(|| format!("exited with code {code}"))
+                );
+                let log = std::fs::read_to_string(batch.join("log")).unwrap();
+                assert_eq!(log.trim(), "batch-output", "{program}");
+                assert_eq!(
+                    std::fs::read_to_string(batch.join("repo/result.txt"))
+                        .unwrap()
+                        .trim(),
+                    "batch-result"
+                );
+            }
+        }
 
         let cancelled = run_job(&LocalJobSpec {
             run_id: "cancelled".into(),
