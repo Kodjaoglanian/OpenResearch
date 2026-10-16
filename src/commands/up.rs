@@ -2064,6 +2064,11 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         state.chat.codex.kill_session(&session.id).await;
         state.chat.claude.forget_session(&session.id).await;
     }
+    let session_ids = sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    local::chat::ChatHost::delete_native_sessions(&session_ids).await?;
     store.delete_local_project(&id)?;
     for session in &sessions {
         local::chat::cleanup_session_transcript_artifacts(&session.id);
