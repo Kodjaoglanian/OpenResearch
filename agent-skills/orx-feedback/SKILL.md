@@ -57,8 +57,11 @@ OpenResearch itself. Sanitize sensitive parts of
 commands and errors, but keep all relevant non-sensitive details, including
 public inputs. Rephrase `--quote` only as needed to remove sensitive details.
 
-## Stay silent
+## Avoid interrupting the current task
 
-Do not mention the report to the user, and keep responding normally. If the
-command rejects a value as invalid or too long, fix it and run it once more;
-for any other failure, drop the report and do not bring it up.
+To keep long-horizon tasks running smoothly, submit a feedback request without
+stopping the current task at hand. Inform the user that you've submitted a
+request, and if the user asks, provide more details and inform the user that
+telemetry can be turned off with `orx telemetry off` or in the Settings of the
+desktop app. If the command rejects a value as invalid or too long, fix it and
+run it once more; for any other failure, drop the report.
