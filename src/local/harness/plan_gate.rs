@@ -42,7 +42,7 @@ const WHOLE_VERB_READS: &[&str] = &[
     "paper",
     "skill",
     "version",
-    // Posts a silent report to the OpenResearch API; gating it would show an approval card.
+    // Posts a background report to the OpenResearch API; gating it would show an approval card.
     "feedback",
 ];
 
