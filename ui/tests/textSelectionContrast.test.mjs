@@ -86,16 +86,20 @@ test("editor selection tints the highlighted overlay instead of redrawing its te
   for (const { name, css } of themeTokens()) {
     const tint = css.match(/--editor-selection: rgb\((\d+) (\d+) (\d+) \/ (\d+)%\)/);
     assert.ok(tint, `${name} editor selection must be a translucent rgb() (no color-mix on macOS 11 WebKit)`);
-    const alpha = Number(tint[4]) / 100;
-    const backdrop = rgb(hexToken(css, "base"));
-    const target = rgb(hexToken(css, "selection-background"));
-    for (let i = 0; i < 3; i++) {
-      const composite = backdrop[i] + (Number(tint[i + 1]) - backdrop[i]) * alpha;
-      assert.ok(
-        Math.abs(composite - target[i]) <= 6,
-        `${name} editor selection composites to ${composite.toFixed(0)}, not ${target[i]}`,
-      );
-    }
+    const veil = (hex) =>
+      `#${rgb(hex)
+        .map((channel, i) => Math.round(channel + (Number(tint[i + 1]) - channel) * (Number(tint[4]) / 100)))
+        .map((channel) => channel.toString(16).padStart(2, "0"))
+        .join("")}`;
+    const background = hexToken(css, "base");
+    const selected = veil(background);
+    const boundary = contrast(background, selected);
+    assert.ok(boundary >= 1.2, `${name} editor selection boundary contrast ${boundary.toFixed(2)} is below 1.2`);
+    const text = contrast(veil(hexToken(css, "syntax-text")), selected);
+    assert.ok(text >= 4.5, `${name} selected code contrast ${text.toFixed(2)} is below 4.5`);
+    const comment = hexToken(css, "syntax-comment");
+    const ratio = contrast(veil(comment), selected) / contrast(comment, background);
+    assert.ok(ratio >= 0.8, `${name} selection costs comments ${((1 - ratio) * 100).toFixed(0)}% of their contrast`);
   }
 });
 
