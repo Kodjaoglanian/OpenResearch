@@ -941,6 +941,8 @@ export const saveModalToken = (tokenId: string, tokenSecret: string) =>
 export interface EnvVar {
   key: string;
   maskedValue: string;
+  /** Set only for non-secret keys, which are shown and edited in the clear. */
+  value?: string | null;
   inProcessEnv: boolean;
 }
 

@@ -4744,9 +4744,11 @@ fn env_settings_json() -> Value {
     let vars: Vec<Value> = crate::config::list_synced_env()
         .iter()
         .map(|(key, value)| {
+            let plain = crate::local::trackio::plain_value(key, value);
             json!({
                 "key": key,
-                "maskedValue": mask_token(value),
+                "maskedValue": mask_token(plain.as_deref().unwrap_or(value)),
+                "value": plain,
                 "inProcessEnv": std::env::var_os(key).is_some(),
             })
         })

@@ -2356,15 +2356,22 @@ function EnvRow({
   const setEnvVarMutation = useMutation({ mutationFn: (args: Parameters<typeof setEnvVar>) => setEnvVar(...args) });
   const deleteEnvVarMutation = useMutation({ mutationFn: deleteEnvVar });
 
-  const [value, setValue] = useState("");
+  const plain = entry?.value != null;
+  const stored = entry?.value ?? "";
+  const [value, setValue] = useState(stored);
   const [saving, setSaving] = useState(false);
+  useEffect(() => setValue(stored), [stored]);
+  const dirty = value.trim() !== stored;
 
   async function save() {
-    if (!value.trim() || saving) return;
+    // An unchanged plain row shows a cleaned value; resaving it would drop a token in the stored URL.
+    if (!value.trim() || saving || (plain && !dirty)) return;
     setSaving(true);
     try {
-      onVars(await setEnvVarMutation.mutateAsync([name, value.trim()]));
-      setValue("");
+      const vars = await setEnvVarMutation.mutateAsync([name, value.trim()]);
+      onVars(vars);
+      // The server may normalize a plain value back to what was already stored.
+      setValue(plain ? vars.find((v) => v.key === name)?.value ?? "" : "");
     } catch (err) {
       showEnvError(name, err);
     } finally {
@@ -2389,7 +2396,7 @@ function EnvRow({
       <tr>
         <td className="font-mono text-sm">{name}</td>
         <td className="text-base text-subtext">
-          {entry ? (
+          {entry && !plain ? (
             <>
               {entry.maskedValue}
               {entry.inProcessEnv && <Badge>{m.settings_page_overridden_by_env()}</Badge>}
@@ -2398,7 +2405,7 @@ function EnvRow({
             <Input
               variant="inline"
               className="text-base"
-              type="password"
+              type={plain ? "text" : "password"}
               value={value}
               onChange={(e) => setValue(e.target.value)}
               onKeyDown={(e) => {
@@ -2406,17 +2413,18 @@ function EnvRow({
                   e.preventDefault();
                   void save();
                 }
-                if (e.key === "Escape" && !saving) setValue("");
+                if (e.key === "Escape" && !saving) setValue(stored);
               }}
               placeholder={m.settings_page_value()}
               aria-label={m.a11y_value_for({ name: ltr(name) })}
-              autoComplete="new-password"
+              autoComplete={plain ? "off" : "new-password"}
               disabled={saving}
             />
           )}
+          {plain && entry?.inProcessEnv && <Badge>{m.settings_page_overridden_by_env()}</Badge>}
         </td>
         <td>
-          {entry ? (
+          {entry && !(plain && dirty && value.trim()) ? (
             <IconButton
               className="[&:hover:not(:disabled)]:text-accent-red"
               title={m.a11y_delete_item({ name: ltr(name) })}
@@ -2534,11 +2542,8 @@ function EnvVarsSection() {
   const varsOptions = getEnvVarsQuery();
   const varsQuery = useQuery(varsOptions);
   const vars = varsQuery.data ?? null;
-  // Bumped on every save or delete so an old Trackio check never describes new settings.
-  const [revision, setRevision] = useState(0);
   const setVars = (value: React.SetStateAction<EnvVar[] | null>) => {
     setScopedQueryData(varsOptions.queryKey, (current) => (typeof value === "function" ? value(current ?? null) : value) ?? undefined);
-    setRevision((n) => n + 1);
   };
   const loadError = vars ? null : varsQuery.error?.message ?? null;
   const [adding, setAdding] = useState(false);
@@ -2585,7 +2590,10 @@ function EnvVarsSection() {
             </tbody>
           </table>
         )}
-        {vars?.some((v) => v.key === "TRACKIO_SERVER_URL") && <TrackioCheck key={revision} />}
+        {vars?.some((v) => v.key === "TRACKIO_SERVER_URL") && (
+          // Any change to the saved Trackio values, from here or elsewhere, resets an old result.
+          <TrackioCheck key={vars.filter((v) => v.key.startsWith("TRACKIO_")).map((v) => `${v.key}=${v.value ?? v.maskedValue}`).join()} />
+        )}
       </div>
     </>
   );
@@ -2606,13 +2614,12 @@ function TrackioCheck() {
   const result = test === null || test === "testing" ? null : test;
   return (
     <div className="mt-3">
-      <div className="actions">
+      <div className="flex items-center gap-2.5">
         <Button type="button" size="small" onClick={() => void runPreflight()} disabled={test === "testing"}>
           {m.settings_trackio_test()}
         </Button>
         <PreflightBadge test={test} />
       </div>
-      {result?.error && <p className={COMPUTE_DIAGNOSTIC_CLASS_NAME}>{result.error}</p>}
       {result?.version && (
         <p className="m-0 mt-2 text-sm text-subtext">
           {m.settings_trackio_version({ version: ltr(result.version) })}
@@ -2620,6 +2627,7 @@ function TrackioCheck() {
           {result.writeAccess === false && <> · {m.settings_trackio_write_rejected()}</>}
         </p>
       )}
+      {result?.error && <p className={COMPUTE_DIAGNOSTIC_CLASS_NAME}>{result.error}</p>}
     </div>
   );
 }
