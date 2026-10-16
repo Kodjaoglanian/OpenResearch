@@ -13,6 +13,24 @@ function visit(node) {
 visit(source);
 assert.ok(focusEffect);
 
+test("the embedded side-chat caller requests focus on mount", () => {
+  const app = ts.createSourceFile("App.tsx", readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const callers = [];
+  function visit(node) {
+    if (ts.isJsxSelfClosingElement(node) && node.tagName.getText(app) === "ChatPanel"
+      && node.attributes.properties.some(prop => ts.isJsxAttribute(prop)
+        && prop.name.text === "key" && prop.initializer?.getText(app) === "{sideTab.sessionId}")) callers.push(node);
+    ts.forEachChild(node, visit);
+  }
+  visit(app);
+  assert.equal(callers.length, 1);
+  const attributes = callers[0].attributes.properties.filter(ts.isJsxAttribute);
+  assert.ok(attributes.some(prop => prop.name.text === "embedded"));
+  const nonce = attributes.find(prop => prop.name.text === "composerFocusNonce")?.initializer;
+  assert.ok(nonce && ts.isJsxExpression(nonce) && nonce.expression && ts.isNumericLiteral(nonce.expression));
+  assert.ok(Number(nonce.expression.text) > 0);
+});
+
 function composer() {
   const frames = new Map();
   const document = { activeElement: null };
