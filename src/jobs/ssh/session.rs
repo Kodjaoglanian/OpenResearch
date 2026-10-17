@@ -301,6 +301,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires a real SSH host; set ORX_SSH_TEST_HOST"]
     async fn real_ssh_reuses_one_shell_across_commands_and_remote_failures() {
