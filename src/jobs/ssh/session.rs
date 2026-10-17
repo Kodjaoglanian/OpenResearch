@@ -86,14 +86,42 @@ pub(super) async fn run(
 }
 
 async fn connection_config(target: &SshTarget) -> Result<Vec<u8>> {
-    let output = Command::new("ssh")
+    let child = Command::new("ssh")
         .env("ORX_SSH_PROBE", "1")
         .args(ssh_opts(target, true))
         .args(["-G", "--", &target.dest])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .output()
-        .await?;
+        .spawn()?;
+    #[cfg(windows)]
+    let pid = child.id();
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let output = match tokio::time::timeout(Duration::from_secs(10), &mut output).await {
+        Ok(output) => output?,
+        Err(_) => {
+            // Match exec can inherit Windows pipes; kill its tree before dropping SSH.
+            #[cfg(windows)]
+            if let Some(pid) = pid {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .kill_on_drop(true)
+                        .status(),
+                )
+                .await;
+            }
+            return Err(anyhow!(
+                "Timed out resolving SSH configuration; check your Match exec commands"
+            ));
+        }
+    };
     if !output.status.success() {
         return Err(anyhow!(
             "Could not resolve SSH configuration: {}",
@@ -428,6 +456,29 @@ mod tests {
         let first = connection_config(&target).await.unwrap();
         std::fs::write(&config, "Host test-alias\n Hostname 127.0.0.2\n").unwrap();
         assert_ne!(connection_config(&target).await.unwrap(), first);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn configuration_match_exec_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("orx-ssh-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config");
+        let delay = if cfg!(windows) {
+            "powershell.exe -NoProfile -Command Start-Sleep -Seconds 12"
+        } else {
+            "sleep 12"
+        };
+        std::fs::write(&config, format!("Match exec \"{delay}\"\n User ignored\n")).unwrap();
+        let mut target = SshTarget::alias("test-alias");
+        target.extra_opts = vec!["-F".into(), config.to_str().unwrap().into()];
+        let error = tokio::time::timeout(Duration::from_secs(15), connection_config(&target))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Timed out resolving SSH configuration"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
