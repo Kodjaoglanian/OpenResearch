@@ -86,42 +86,31 @@ pub(super) async fn run(
 }
 
 async fn connection_config(target: &SshTarget) -> Result<Vec<u8>> {
-    let child = Command::new("ssh")
+    let mut command = Command::new("ssh");
+    command
         .env("ORX_SSH_PROBE", "1")
         .args(ssh_opts(target, true))
         .args(["-G", "--", &target.dest])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
     #[cfg(windows)]
-    let pid = child.id();
-    let output = child.wait_with_output();
-    tokio::pin!(output);
-    let output = match tokio::time::timeout(Duration::from_secs(10), &mut output).await {
-        Ok(output) => output?,
-        Err(_) => {
-            // Match exec can inherit Windows pipes; kill its tree before dropping SSH.
-            #[cfg(windows)]
-            if let Some(pid) = pid {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(3),
-                    Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .kill_on_drop(true)
-                        .status(),
-                )
-                .await;
-            }
-            return Err(anyhow!(
-                "Timed out resolving SSH configuration; check your Match exec commands"
-            ));
-        }
+    command.creation_flags(crate::local::codex::windows_job::SPAWN_FLAGS);
+    let child = command.spawn()?;
+    // Match exec inherits Windows pipes; closing the job must also clean up on cancellation.
+    #[cfg(windows)]
+    let _job = {
+        use crate::local::codex::windows_job;
+        let job = windows_job::assign(&child)?;
+        windows_job::resume(child.id().unwrap())?;
+        job
     };
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .map_err(|_| {
+            anyhow!("Timed out resolving SSH configuration; check your Match exec commands")
+        })??;
     if !output.status.success() {
         return Err(anyhow!(
             "Could not resolve SSH configuration: {}",
@@ -479,6 +468,47 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Timed out resolving SSH configuration"));
-        std::fs::remove_dir_all(dir).unwrap();
+        remove_config_dir(&dir).await;
+    }
+
+    async fn remove_config_dir(dir: &std::path::Path) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while std::fs::remove_dir_all(dir).is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancelling_configuration_kills_match_exec_descendants() {
+        let dir = std::env::temp_dir().join(format!("orx-ssh-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config");
+        let marker = dir.join("started");
+        let path = marker
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "''");
+        std::fs::write(
+            &config,
+            format!("Match exec \"powershell.exe -NoProfile -Command [IO.File]::WriteAllText('{path}', 'started'); Start-Sleep -Seconds 12\"\n User ignored\n"),
+        )
+        .unwrap();
+        let mut target = SshTarget::alias("test-alias");
+        target.extra_opts = vec!["-F".into(), config.to_str().unwrap().into()];
+        let probe = tokio::spawn(async move { connection_config(&target).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        probe.abort();
+        assert!(probe.await.unwrap_err().is_cancelled());
+        remove_config_dir(&dir).await;
     }
 }
