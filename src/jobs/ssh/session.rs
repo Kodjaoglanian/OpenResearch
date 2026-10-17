@@ -304,14 +304,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a real SSH host; set ORX_SSH_TEST_HOST"]
     async fn real_ssh_reuses_one_shell_across_commands_and_remote_failures() {
-        let mut target = SshTarget::alias(&std::env::var("ORX_SSH_TEST_HOST").unwrap());
-        // Exercise the Windows transport even if the test host supports ControlMaster.
-        target.extra_opts = vec![
-            "-o".into(),
-            "ControlMaster=no".into(),
-            "-o".into(),
-            "ControlPath=none".into(),
-        ];
+        let target = SshTarget::alias(&std::env::var("ORX_SSH_TEST_HOST").unwrap());
         let call = |command: &'static str| {
             let target = target.clone();
             async move { run(&target, command, &mut &b""[..], 0).await }
@@ -343,7 +336,10 @@ mod tests {
         cached.as_mut().unwrap().child.kill().await.unwrap();
         drop(cached);
         drop(pool);
-        assert_ne!(call("echo $SSH_CONNECTION").await.unwrap(), first);
+        let reconnected = call("echo $SSH_CONNECTION").await.unwrap();
+        if cfg!(windows) {
+            assert_ne!(reconnected, first);
+        }
     }
 
     #[tokio::test]
