@@ -2,18 +2,18 @@
 
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use super::{sh_quote, ssh_opts, SshTarget};
 use crate::error::{anyhow, Result};
 
 // Length framing preserves binary archives, partial log lines, and arbitrary command output.
-const WORKER: &str = r#"set -e
+const WORKER: &str = r#"set -eo pipefail
 umask 077
 work=$(mktemp -d) || exit 1
 trap 'rm -rf -- "$work"' EXIT
@@ -21,9 +21,12 @@ printf 'ORX_SSH_READY\n'
 while read -r command_size input_size; do
     head -c "$command_size" > "$work/command"
     test "$(wc -c < "$work/command")" -eq "$command_size" || exit 1
-    head -c "$input_size" > "$work/input"
-    test "$(wc -c < "$work/input")" -eq "$input_size" || exit 1
-    if bash -c "$(cat "$work/command")" < "$work/input" > "$work/out" 2> "$work/err"; then
+    if head -c "$input_size" | {
+        code=0
+        bash -c "$(cat "$work/command")" > "$work/out" 2> "$work/err" || code=$?
+        cat > /dev/null
+        exit "$code"
+    }; then
         code=0
     else
         code=$?
@@ -51,10 +54,18 @@ pub(super) async fn run(
         .or_default()
         .clone();
     let mut slot = slot.lock().await;
+    // -G resolves Includes and alias changes locally; it opens no SSH connection.
+    let config = connection_config(target).await?;
     // A cancelled request must drop its transport, not leave a half-read reply in the pool.
-    let mut session = match slot.take() {
+    let mut cached = slot.take();
+    if let Some(session) = &mut cached {
+        if session.config != config || session.child.try_wait()?.is_some() {
+            cached = None;
+        }
+    }
+    let mut session = match cached {
         Some(session) => session,
-        None => connect(target).await?,
+        None => connect(target, config).await?,
     };
     match session.request(command, input, size).await {
         Ok(reply) => {
@@ -74,9 +85,27 @@ pub(super) async fn run(
     }
 }
 
-async fn connect(target: &SshTarget) -> Result<Session> {
+async fn connection_config(target: &SshTarget) -> Result<Vec<u8>> {
+    let output = Command::new("ssh")
+        .env("ORX_SSH_PROBE", "1")
+        .args(ssh_opts(target, true))
+        .args(["-G", "--", &target.dest])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Could not resolve SSH configuration: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+async fn connect(target: &SshTarget, config: Vec<u8>) -> Result<Session> {
     for attempt in 0..4 {
-        let result = Session::start(target).await;
+        let result = Session::start(target, config.clone()).await;
         match result {
             Ok(session) => return Ok(session),
             Err(error) if attempt < 3 && connect_timeout(&error.to_string()) => {
@@ -103,6 +132,44 @@ struct Session {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    config: Vec<u8>,
+    diagnostics: Diagnostics,
+}
+
+struct Diagnostics {
+    done: tokio::sync::oneshot::Receiver<()>,
+    tail: Arc<StdMutex<Vec<u8>>>,
+}
+
+impl Diagnostics {
+    fn from_child(stderr: ChildStderr) -> Result<Self> {
+        // Cached Windows pipes must not keep Tokio's blocking workers alive at CLI exit.
+        #[cfg(windows)]
+        let stderr = std::fs::File::from(stderr.into_owned_handle()?);
+        #[cfg(unix)]
+        let stderr = std::fs::File::from(stderr.into_owned_fd()?);
+        Ok(Self::new(stderr))
+    }
+
+    fn new(mut stderr: impl std::io::Read + Send + 'static) -> Self {
+        let tail = Arc::new(StdMutex::new(Vec::new()));
+        let output = tail.clone();
+        let (finished, done) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            while let Ok(count) = stderr.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                let mut output = output.lock().unwrap();
+                output.extend_from_slice(&buffer[..count]);
+                let excess = output.len().saturating_sub(8192);
+                output.drain(..excess);
+            }
+            let _ = finished.send(());
+        });
+        Self { done, tail }
+    }
 }
 
 struct Reply {
@@ -112,7 +179,7 @@ struct Reply {
 }
 
 impl Session {
-    async fn start(target: &SshTarget) -> Result<Self> {
+    async fn start(target: &SshTarget, config: Vec<u8>) -> Result<Self> {
         let mut child = Command::new("ssh")
             .env("ORX_SSH_PROBE", "1")
             .args(ssh_opts(target, true))
@@ -126,10 +193,13 @@ impl Session {
             .map_err(|error| anyhow!("Could not run ssh: {error}"))?;
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
+        let diagnostics = Diagnostics::from_child(child.stderr.take().unwrap())?;
         let mut session = Self {
             child,
             stdin,
             stdout,
+            config,
+            diagnostics,
         };
         let ready = tokio::time::timeout(Duration::from_secs(45), session.ready()).await;
         match ready {
@@ -198,13 +268,10 @@ impl Session {
 
     async fn failure(mut self, dest: &str, error: anyhow::Error) -> anyhow::Error {
         let _ = self.child.kill().await;
-        let stderr = self
-            .child
-            .wait_with_output()
-            .await
-            .ok()
-            .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
-            .unwrap_or_default();
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut self.diagnostics.done).await;
+        let stderr = String::from_utf8_lossy(&self.diagnostics.tail.lock().unwrap())
+            .trim()
+            .to_string();
         anyhow!(
             "ssh {dest}: {error}{separator}{stderr}",
             separator = if stderr.is_empty() { "" } else { ": " }
@@ -242,7 +309,7 @@ mod tests {
             let target = target.clone();
             async move { run(&target, command, &mut &b""[..], 0).await }
         };
-        let first = call("echo $PPID").await.unwrap();
+        let first = call("echo $SSH_CONNECTION").await.unwrap();
         assert!(call("echo expected_error >&2; exit 42")
             .await
             .unwrap_err()
@@ -250,7 +317,7 @@ mod tests {
             .contains("expected_error"));
         let mut requests = tokio::task::JoinSet::new();
         for _ in 0..12 {
-            requests.spawn(call("echo $PPID"));
+            requests.spawn(call("echo $SSH_CONNECTION"));
         }
         while let Some(result) = requests.join_next().await {
             assert_eq!(result.unwrap().unwrap(), first);
@@ -263,12 +330,18 @@ mod tests {
                 .trim(),
             data.len().to_string()
         );
+        let key = (target.dest.clone(), target.extra_opts.clone());
+        let pool = SESSIONS.get().unwrap().lock().await;
+        let mut cached = pool.get(&key).unwrap().lock().await;
+        cached.as_mut().unwrap().child.kill().await.unwrap();
+        drop(cached);
+        drop(pool);
+        assert_ne!(call("echo $SSH_CONNECTION").await.unwrap(), first);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn batch_shell_preserves_binary_input_failures_and_response_boundaries() {
-        let mut child = Command::new("bash")
+        let mut child = Command::new(crate::local::bash::program())
             .args(["-c", WORKER])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -279,6 +352,8 @@ mod tests {
         let mut session = Session {
             stdin: child.stdin.take().unwrap(),
             stdout: BufReader::new(child.stdout.take().unwrap()),
+            diagnostics: Diagnostics::from_child(child.stderr.take().unwrap()).unwrap(),
+            config: Vec::new(),
             child,
         };
         session.ready().await.unwrap();
@@ -300,6 +375,56 @@ mod tests {
             .unwrap();
         assert_eq!(reply.code, 0);
         assert_eq!(reply.stdout, "second\n\u{2713}".as_bytes());
+        let data = vec![b'x'; 512 * 1024];
+        let reply = session
+            .request("head -c 1; exit 42", &mut &data[..], data.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(reply.stdout, b"x");
+        assert_eq!(reply.code, 42);
+        let reply = session
+            .request("printf aligned", &mut &b""[..], 0)
+            .await
+            .unwrap();
+        assert_eq!(reply.stdout, b"aligned");
         session.child.kill().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_stderr_is_drained_with_bounded_diagnostics() {
+        let mut child = std::process::Command::new(crate::local::bash::program())
+            .args([
+                "-c",
+                "head -c 262144 /dev/zero >&2; printf 'last diagnostic' >&2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut diagnostics = Diagnostics::new(child.stderr.take().unwrap());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            (&mut diagnostics.done).await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+        let tail = diagnostics.tail.lock().unwrap();
+        assert_eq!(tail.len(), 8192);
+        assert!(tail.ends_with(b"last diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn effective_configuration_detects_an_alias_retarget_without_connecting() {
+        let dir = std::env::temp_dir().join(format!("orx-ssh-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config");
+        let mut target = SshTarget::alias("test-alias");
+        target.extra_opts = vec!["-F".into(), config.to_str().unwrap().into()];
+        std::fs::write(&config, "Host test-alias\n Hostname 127.0.0.1\n").unwrap();
+        let first = connection_config(&target).await.unwrap();
+        std::fs::write(&config, "Host test-alias\n Hostname 127.0.0.2\n").unwrap();
+        assert_ne!(connection_config(&target).await.unwrap(), first);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

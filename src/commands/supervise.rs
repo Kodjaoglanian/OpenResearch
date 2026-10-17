@@ -59,8 +59,8 @@ fn lock_held(path: &std::path::Path) -> bool {
 async fn log_pass<T>(
     done: &mut tokio::sync::watch::Receiver<bool>,
     draining: bool,
-    pass: impl std::future::Future<Output = Result<T>>,
-) -> Option<Result<T>> {
+    pass: impl std::future::Future<Output = T>,
+) -> Option<T> {
     if draining {
         return Some(pass.await);
     }
@@ -837,7 +837,7 @@ async fn tail_logs_ssh(
     dir: String,
     path: std::path::PathBuf,
     run_id: String,
-    done: tokio::sync::watch::Receiver<bool>,
+    mut done: tokio::sync::watch::Receiver<bool>,
     errors: Option<tokio::sync::watch::Sender<Option<String>>>,
 ) {
     let interval = ssh_poll_interval(
@@ -867,7 +867,7 @@ async fn tail_logs_ssh(
                 seen = s;
                 last_error = None;
             }
-            // Retries every 2s through an outage; log each distinct failure once.
+            // Retry through an outage; log each distinct failure once.
             Err(err) => {
                 let err = err.to_string();
                 if last_error.as_ref() != Some(&err) {
@@ -883,7 +883,7 @@ async fn tail_logs_ssh(
         if draining && last_error.is_none() {
             return;
         }
-        tokio::time::sleep(interval).await;
+        log_pass(&mut done, draining, tokio::time::sleep(interval)).await;
     }
 }
 
@@ -1634,7 +1634,7 @@ mod tests {
         };
         let (interrupted, ()) = tokio::join!(log_pass(&mut rx, false, stalled), flip);
         assert!(interrupted.is_none());
-        let drained = log_pass(&mut rx, true, async { Ok(7) }).await;
+        let drained = log_pass(&mut rx, true, async { Ok::<_, anyhow::Error>(7) }).await;
         assert_eq!(drained.unwrap().unwrap(), 7);
     }
 
@@ -1669,6 +1669,20 @@ mod tests {
         for value in [None, Some("0"), Some("-1"), Some("invalid")] {
             assert_eq!(ssh_poll_interval(value, default), default);
         }
+    }
+
+    #[tokio::test]
+    async fn completion_wakes_a_long_ssh_poll_sleep_for_final_drain() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(1),
+            log_pass(&mut rx, false, tokio::time::sleep(Duration::from_secs(60))),
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(*rx.borrow());
     }
 
     #[test]
