@@ -301,11 +301,17 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[tokio::test]
     #[ignore = "requires a real SSH host; set ORX_SSH_TEST_HOST"]
     async fn real_ssh_reuses_one_shell_across_commands_and_remote_failures() {
-        let target = SshTarget::alias(&std::env::var("ORX_SSH_TEST_HOST").unwrap());
+        let mut target = SshTarget::alias(&std::env::var("ORX_SSH_TEST_HOST").unwrap());
+        // Exercise the Windows transport even if the test host supports ControlMaster.
+        target.extra_opts = vec![
+            "-o".into(),
+            "ControlMaster=no".into(),
+            "-o".into(),
+            "ControlPath=none".into(),
+        ];
         let call = |command: &'static str| {
             let target = target.clone();
             async move { run(&target, command, &mut &b""[..], 0).await }
