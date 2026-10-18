@@ -5,6 +5,7 @@ import remarkRehype from "remark-rehype";
 import { unified } from "unified";
 
 import {
+  chatImageAssetTarget,
   chatImageTarget,
   chatImageTargets,
   citedFilePath,
@@ -171,9 +172,24 @@ test("chat artifact images retain existing lookup order before trying a nested a
 });
 
 test("HTML assets keep the same artifact or checkout candidate as their document", () => {
-  const figure = chatImageTargets("artifacts/run/chart.html");
-  const asset = chatImageTargets(htmlFigureAssetTarget("artifacts/run/chart.html", "chart%231.png"));
-  assert.deepEqual(asset, figure.map(target => ({ ...target, path: target.path.replace("chart.html", "chart#1.png") })));
+  const figures = chatImageTargets("artifacts/run/chart.html");
+  assert.deepEqual(figures.map(figure => chatImageAssetTarget(figure, "chart%231.png")),
+    figures.map(target => ({ ...target, path: target.path.replace("chart.html", "chart#1.png") })));
+  assert.deepEqual(chatImageAssetTarget(figures[0], "../shared.png"), { path: "shared.png", hash: "", source: "artifact" });
+  assert.equal(chatImageAssetTarget(figures[0], "../../shared.png"), null);
+  assert.deepEqual(chatImageAssetTarget(figures[1], "../../shared.png"), { path: "shared.png", hash: "", source: "checkout" });
+  assert.deepEqual(chatImageAssetTarget(figures[2], "../../shared.png"), { path: "shared.png", hash: "", source: "artifact" });
+  assert.deepEqual(chatImageAssetTarget(figures[2], "chart%25231.svg?path=/secret#plot"), {
+    path: "artifacts/run/chart%231.svg", hash: "#plot", source: "artifact",
+  });
+  for (const src of ["../../../secret.png", "..%2F..%2F..%2Fsecret.png", "%E0%A4%A", "a%00.png", "javascript:1"]) {
+    assert.equal(chatImageAssetTarget(figures[2], src), null, src);
+  }
+  for (const src of ["/tmp/image.png", "~/image.png", "C:/figs/image.png", "C%3A/figs/image.png"]) {
+    assert.deepEqual(chatImageAssetTarget(figures[2], src), chatImageTarget(src));
+  }
+  const windows = chatImageTarget("C:/figs/chart.html");
+  assert.deepEqual(chatImageAssetTarget(windows, "chart%231.png"), { path: "C:/figs/chart#1.png", hash: "", source: "absolute" });
 });
 
 test("non-artifact images do not gain fallbacks and invalid paths stay rejected", () => {

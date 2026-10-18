@@ -130,6 +130,15 @@ export function chatImageTargets(src: string): NonNullable<ReturnType<typeof cha
   return [target, { ...target, path, source: "checkout" }, { ...target, path }];
 }
 
+export function chatImageAssetTarget(figure: NonNullable<ReturnType<typeof chatImageTarget>>, src: string): ReturnType<typeof chatImageTarget> {
+  const absolute = chatImageTarget(src);
+  if (absolute?.source === "absolute") return absolute;
+  if (isExternalMarkdownTarget(src)) return null;
+  const asset = htmlFigureAssetTarget(encodeMarkdownPath(figure.path), src);
+  const resolved = asset ? resolveMarkdownTarget("", asset, true) : null;
+  return resolved ? { path: resolved.path, hash: resolved.hash, source: figure.source } : null;
+}
+
 interface HastNode {
   tagName?: string;
   children?: HastNode[];

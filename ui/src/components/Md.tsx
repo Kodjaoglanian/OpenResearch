@@ -27,18 +27,20 @@ import { absoluteFileUrl, artifactUrl, projectFileUrl } from "../api";
 import { InlineHtmlFigure } from "./InlineHtmlFigure";
 import { ImageCarousel, ImageCarouselContext } from "./ImageCarousel";
 import { imageWheelZoom } from "../imageZoom";
-import { chatImageTarget, chatImageTargets, citedFilePath, encodeMarkdownPath, firstCitedLine, rehypeSafeUrls, splitLineSuffix } from "../markdownTarget";
+import { chatImageAssetTarget, chatImageTarget, chatImageTargets, citedFilePath, encodeMarkdownPath, firstCitedLine, htmlFigureAssetTarget, rehypeSafeUrls, splitLineSuffix } from "../markdownTarget";
 
-const ImageResolverContext = createContext<((src: string) => string[]) | undefined>(undefined);
+const ImageResolverContext = createContext<((src: string, source?: string, attempt?: number) => string[]) | undefined>(undefined);
 
 export function ChatImageScope({ projectId, sessionId, children }: {
   projectId: string;
   sessionId?: string | null;
   children: ReactNode;
 }) {
-  const resolver = useMemo(() => (src: string) => {
+  const resolver = useMemo(() => (src: string, source?: string, attempt = 0) => {
     if (/^(https?:)?\/\//i.test(src)) return [src];
-    return chatImageTargets(src).map(target => {
+    const figure = source ? chatImageTargets(source)[attempt] : null;
+    const asset = figure ? chatImageAssetTarget(figure, src) : null;
+    return (source ? asset ? [asset] : [] : chatImageTargets(src)).map(target => {
       const url = target.source === "absolute" ? absoluteFileUrl(target.path)
         : target.source === "artifact" ? artifactUrl(projectId, target.path)
         : projectFileUrl(projectId, target.path, { sessionId: sessionId ?? undefined });
@@ -425,8 +427,9 @@ export const Md = memo(function Md({
 }) {
   useLocale();
   const chatImageSrc = useContext(ImageResolverContext);
-  const imageSrc = useMemo(() => resolveImageSrc ? (src: string) => {
-    const resolved = resolveImageSrc(src);
+  const imageSrc = useMemo(() => resolveImageSrc ? (src: string, source?: string) => {
+    const target = source ? htmlFigureAssetTarget(source, src) : src;
+    const resolved = target ? resolveImageSrc(target) : null;
     return resolved ? [resolved] : [];
   } : chatImageSrc, [resolveImageSrc, chatImageSrc]);
   // Callers pass fresh callbacks; a new `img` type would remount every image.
