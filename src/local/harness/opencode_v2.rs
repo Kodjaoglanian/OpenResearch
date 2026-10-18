@@ -902,7 +902,7 @@ async fn session_generate(
     if created.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
-    let created = created.error_for_status()?.json::<Value>().await?;
+    let created = decode_response(created).await?;
     let id = created
         .pointer("/data/id")
         .and_then(Value::as_str)
@@ -923,6 +923,15 @@ async fn session_generate(
 
 /// Read `/data/text` from a generate reply, or surface the provider's reason.
 async fn decode_generate(response: reqwest::Response) -> Result<String> {
+    decode_response(response)
+        .await?
+        .pointer("/data/text")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("returned no reply"))
+}
+
+async fn decode_response(response: reqwest::Response) -> Result<Value> {
     let status = response.status();
     if !status.is_success() {
         // The body carries the provider's reason; the URL is a throwaway local port.
@@ -932,12 +941,7 @@ async fn decode_generate(response: reqwest::Response) -> Result<String> {
             crate::local::harness::one_line(&body, 300)
         ));
     }
-    let response: Value = response.json().await?;
-    response
-        .pointer("/data/text")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("returned no reply"))
+    Ok(response.json().await?)
 }
 
 pub(super) async fn generate(
@@ -1261,23 +1265,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_session_response_is_not_a_missing_route() {
-        use axum::{routing::post, Json, Router};
+    async fn session_creation_errors_do_not_fall_back() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
 
-        let app = Router::new()
-            .route("/api/session", post(|| async { Json(json!({"data":{}})) }))
-            .route(
-                "/api/experimental/generate",
-                post(|| async { Json(json!({"data":{"text":"unexpected fallback"}})) }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = mock_endpoint(&listener, false);
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let error = generate_text(&endpoint, None, "hi", Duration::from_secs(5))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("session response has no id"));
-        server.abort();
+        for status in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+            let app = Router::new()
+                .route(
+                    "/api/session",
+                    post(move || async move {
+                        (status, Json(json!({"message":"session creation failed"})))
+                    }),
+                )
+                .route(
+                    "/api/experimental/generate",
+                    post(|| async { Json(json!({"data":{"text":"unexpected fallback"}})) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = mock_endpoint(&listener, false);
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let error = generate_text(&endpoint, None, "hi", Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            if status == StatusCode::OK {
+                assert!(error.to_string().contains("session response has no id"));
+            } else {
+                assert!(error.to_string().contains(
+                    "503 Service Unavailable: {\"message\":\"session creation failed\"}"
+                ));
+            }
+            server.abort();
+        }
     }
 
     #[test]
