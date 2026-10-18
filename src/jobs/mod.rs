@@ -58,6 +58,7 @@ pub struct BackendDescriptor {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cancellation_accepted: bool,
     pub kind: String,
+    /// Local jobs: Linux boot id / mount namespace, to preflight same-command launches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

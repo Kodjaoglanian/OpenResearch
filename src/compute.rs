@@ -789,6 +789,22 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     let project = store
         .get_local_project(&experiment.project_id)?
         .ok_or_else(|| anyhow!("Local project {} not found.", experiment.project_id))?;
+    let command = Some(experiment.run_command.clone())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            project
+                .run_command
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_default();
+    let namespace = crate::local::localrun::mount_namespace(backend_id)?;
+    crate::local::localrun::check_mount_namespace(
+        &store,
+        &project.id,
+        &command,
+        namespace.as_deref(),
+    )?;
     let preflight = backend.preflight(args).await?;
     if !preflight.ready {
         return Err(anyhow!(
@@ -801,21 +817,12 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     }
     let source = backend.stage_source(&project, &experiment).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
-    let command = Some(experiment.run_command.clone())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            project
-                .run_command
-                .clone()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_default();
     let mut descriptor = BackendDescriptor {
         ssh_container: None,
         monitoring_error: None,
         cancellation_accepted: false,
         kind: format!("{}_job", backend_id),
-        namespace: None,
+        namespace,
         job_id: None,
         flavor: args.flavor.clone(),
         image: args.image.clone(),
@@ -998,7 +1005,16 @@ fn reserve_run(
             ));
         }
     }
-    let tx = store.begin()?;
+    let tx = store.begin_immediate()?;
+    let descriptor = BackendDescriptor::parse(&pending.backend_json)?;
+    if descriptor.kind == "local_job" {
+        crate::local::localrun::check_mount_namespace(
+            store,
+            &pending.project_id,
+            &pending.command,
+            descriptor.namespace.as_deref(),
+        )?;
+    }
     store.reserve_run_telemetry(&pending.id, identity, report)?;
     store.upsert_run(pending)?;
     tx.commit()?;
