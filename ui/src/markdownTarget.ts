@@ -122,6 +122,14 @@ export function chatImageTarget(src: string): (Pick<MarkdownTarget, "path" | "ha
   return { ...target, source: "checkout" };
 }
 
+export function chatImageTargets(src: string): NonNullable<ReturnType<typeof chatImageTarget>>[] {
+  const target = chatImageTarget(src);
+  if (!target) return [];
+  if (target.source !== "artifact") return [target];
+  const path = `artifacts/${target.path}`;
+  return [target, { ...target, path, source: "checkout" }, { ...target, path }];
+}
+
 interface HastNode {
   tagName?: string;
   children?: HastNode[];

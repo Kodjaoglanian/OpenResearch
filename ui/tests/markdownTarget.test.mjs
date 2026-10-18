@@ -6,6 +6,7 @@ import { unified } from "unified";
 
 import {
   chatImageTarget,
+  chatImageTargets,
   citedFilePath,
   encodeMarkdownPath,
   firstCitedLine,
@@ -151,6 +152,37 @@ test("chat image URLs discard injected query parameters and preserve SVG fragmen
   });
   assert.equal(chatImageTarget("figures/100%25.png").path, "figures/100%.png");
   assert.equal(chatImageTarget(String.raw`C:\papers\figure.png`).path, "C:/papers/figure.png");
+});
+
+test("chat artifact images retain existing lookup order before trying a nested artifacts folder", () => {
+  for (const ext of ["html", "svg", "png"]) {
+    const path = `tiny-learning-rate-comparison/chart.${ext}`;
+    assert.deepEqual(chatImageTargets(`artifacts/${path}`), [
+      { path, hash: "", source: "artifact" },
+      { path: `artifacts/${path}`, hash: "", source: "checkout" },
+      { path: `artifacts/${path}`, hash: "", source: "artifact" },
+    ]);
+  }
+  assert.deepEqual(chatImageTargets("artifacts/chart%25231.svg?path=/secret#plot"), [
+    { path: "chart%231.svg", hash: "#plot", source: "artifact" },
+    { path: "artifacts/chart%231.svg", hash: "#plot", source: "checkout" },
+    { path: "artifacts/chart%231.svg", hash: "#plot", source: "artifact" },
+  ]);
+});
+
+test("HTML assets keep the same artifact or checkout candidate as their document", () => {
+  const figure = chatImageTargets("artifacts/run/chart.html");
+  const asset = chatImageTargets(htmlFigureAssetTarget("artifacts/run/chart.html", "chart%231.png"));
+  assert.deepEqual(asset, figure.map(target => ({ ...target, path: target.path.replace("chart.html", "chart#1.png") })));
+});
+
+test("non-artifact images do not gain fallbacks and invalid paths stay rejected", () => {
+  for (const src of ["paper/figure.png", "/tmp/figure.png", "~/figure.png", "C:/papers/figure.png"]) {
+    assert.deepEqual(chatImageTargets(src), [chatImageTarget(src)]);
+  }
+  for (const src of ["../secret.png", "artifacts/../../secret.png", "%E0%A4%A", "javascript:1", "https://example.com/image.png"]) {
+    assert.deepEqual(chatImageTargets(src), [], src);
+  }
 });
 
 test("file citations split off their line suffix", () => {
