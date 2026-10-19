@@ -538,6 +538,7 @@ export function ModelPicker({
  * Claude Code composer menu: a header, the current-default row pinned at top
  * with a "· Default" note, then the full numbered list. */
 export function OptionPicker({
+  triggerIcon,
   choices,
   value,
   defaultId,
@@ -555,6 +556,7 @@ export function OptionPicker({
   onSelect,
   className,
 }: {
+  triggerIcon?: ReactNode;
   choices: OptionChoice[];
   value: string | null;
   /** The harness's default id — pinned at top of the menu and used when
@@ -635,6 +637,19 @@ export function OptionPicker({
 
   return (
     <div className={`option-picker relative inline-flex${variant === "field" ? " w-full" : ""}`} ref={ref}>
+      {triggerIcon ? (
+        <IconButton
+          ref={buttonRef}
+          size="small"
+          aria-label={title ?? header ?? label}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          disabled={disabled}
+          onClick={() => { setFilter(""); setOpen((v) => !v); }}
+        >
+          {triggerIcon}
+        </IconButton>
+      ) : (
       <button
         ref={buttonRef}
         type="button"
@@ -656,6 +671,7 @@ export function OptionPicker({
         </span>
         <ChevronDown size={12} />
       </button>
+      )}
       {open && (
         <div ref={menuRef} popover={floating ? "manual" : undefined}
           style={floating ? { position: "fixed", inset: "auto", margin: 0 } : undefined}
