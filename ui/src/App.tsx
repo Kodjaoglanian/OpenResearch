@@ -1,6 +1,8 @@
 import {
   setScopedQueryData,
   deletedSessionIds,
+  isCurrentScope,
+  workspaceScope,
   queryClient,
 } from "./queries/client";
 import { useMutation, useQuery } from "@tanstack/react-query";
@@ -1304,6 +1306,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   }, [sessionsQuery.data, sideTabs, forgetSideTab]);
 
   const startSideChat = useCallback(async (parentSessionId: string, question: string) => {
+    const scope = workspaceScope();
     let session;
     try {
       session = await openSideChat(parentSessionId);
@@ -1311,7 +1314,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       showAlert(m.side_chat_open_failed({ error: errorText(error) }), "error");
       return;
     }
-    if (deletedSessionIds.has(session.id) || deletedSessionIds.has(parentSessionId)) return;
+    if (!isCurrentScope(scope) || deletedSessionIds.has(session.id) || deletedSessionIds.has(parentSessionId)) return;
     setScopedQueryData(listChatSessionsQuery(session.projectId).queryKey, (current) =>
       current && [session, ...current.filter((row) => row.id !== session.id)]);
     if (navigationRef.current.activeSessionId === parentSessionId) openSideTab(session.id);
