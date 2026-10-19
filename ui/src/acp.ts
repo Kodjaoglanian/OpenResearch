@@ -1,4 +1,20 @@
 import type { ChatSession, Harness, OptionChoice } from "./api";
+import { shellWords } from "./orxCommand.ts";
+
+export function parseAcpCommand(command: string): { executable: string; arguments: string[] } | null {
+  try {
+    const [executable, ...args] = shellWords(command.trim(), false, true);
+    if (!executable || /^[A-Za-z_]\w*=/.test(executable) || !validAcpLaunch("Agent", executable, args)) return null;
+    return { executable, arguments: args };
+  } catch {
+    return null;
+  }
+}
+
+export function formatAcpCommand(executable: string, args: string[]): string {
+  return [executable, ...args].map((word) => /^[\w./:@%+=,-]+$/.test(word)
+    ? word : `'${word.replaceAll("'", "'\\''")}'`).join(" ");
+}
 
 export interface NativeOption {
   id: string;
@@ -53,7 +69,7 @@ export function sessionAcpHarness(session: ChatSession | null | undefined, catal
   return {
     id: session.harness, name: session.harnessName ?? catalog?.name ?? "ACP", installed: true,
     installBroken: false, authenticated: false, authState: "unknown", agentReady: true, supportsSteering: false,
-    models: model ? model.choices.map((choice) => ({ id: choice.id, displayName: choice.label, description: choice.description })) : [{ id: "default" }],
+    models: model ? model.choices.map((choice) => ({ id: choice.id, displayName: choice.label, description: choice.description })) : catalog?.models ?? [{ id: "default" }],
     options: { permissionModes: [], reasoningLevels: [], defaultPermissionMode: null, defaultReasoningLevel: null },
   };
 }

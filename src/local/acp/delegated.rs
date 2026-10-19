@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
@@ -85,6 +86,7 @@ impl Drop for Terminal {
 pub struct Delegated {
     cwd: PathBuf,
     terminals: Mutex<HashMap<String, Arc<Terminal>>>,
+    shell_commands: AtomicBool,
 }
 
 impl Delegated {
@@ -92,7 +94,13 @@ impl Delegated {
         Self {
             cwd: cwd.to_owned(),
             terminals: Mutex::new(HashMap::new()),
+            shell_commands: AtomicBool::new(false),
         }
+    }
+
+    pub fn set_agent(&self, name: &str) {
+        self.shell_commands
+            .store(matches!(name, "affogato" | "grok"), Ordering::Relaxed);
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -171,7 +179,21 @@ impl Delegated {
         if request.command.is_empty() {
             bail!("Terminal command must not be empty");
         }
-        let mut command = tokio::process::Command::new(request.command);
+        // Devin and Grok send shell programs in command rather than executable/args.
+        let mut command = if self.shell_commands.load(Ordering::Relaxed) && request.args.is_empty()
+        {
+            #[cfg(unix)]
+            let mut command = tokio::process::Command::new("/bin/sh");
+            #[cfg(unix)]
+            command.args(["-c", &request.command]);
+            #[cfg(windows)]
+            let mut command = tokio::process::Command::new("cmd.exe");
+            #[cfg(windows)]
+            command.args(["/D", "/S", "/C", &request.command]);
+            command
+        } else {
+            tokio::process::Command::new(request.command)
+        };
         command
             .args(request.args)
             .current_dir(cwd)
@@ -287,9 +309,41 @@ async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin, output: Arc<Mutex<Ou
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn known_shell_commands_are_scoped_to_their_agents() {
+        let delegated = Delegated::new(&std::env::temp_dir());
+        let request =
+            json!({"sessionId":"s", "command":"printf 'DEVIN_SHELL_OK'; printf ' SECOND'"});
+        assert!(delegated
+            .request("terminal/create", request.clone())
+            .await
+            .is_err());
+        for agent in ["affogato", "grok"] {
+            delegated.set_agent(agent);
+            let created = delegated
+                .request("terminal/create", request.clone())
+                .await
+                .unwrap();
+            let params = json!({"terminalId":created["terminalId"]});
+            let exit = delegated
+                .request("terminal/wait_for_exit", params.clone())
+                .await
+                .unwrap();
+            assert_eq!(exit["exitCode"], 0);
+            let output = delegated
+                .request("terminal/output", params.clone())
+                .await
+                .unwrap();
+            assert_eq!(output["output"], "DEVIN_SHELL_OK SECOND");
+            delegated.request("terminal/release", params).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn terminal_arguments_environment_and_cancellation_are_preserved() {
         let delegated = Delegated::new(&std::env::temp_dir());
+        delegated.set_agent("grok");
         let python = if cfg!(windows) { "python" } else { "python3" };
         let created = delegated.request("terminal/create", json!({"sessionId":"s", "command":python, "args":["-c", "import os,sys;print(sys.argv[1]);print(os.environ['ACP_TEST_VALUE']);sys.stdout.flush();import time;time.sleep(60)", "two words \"quoted\" $(untouched)"], "env":[{"name":"ACP_TEST_VALUE", "value":"native value"}]})).await.unwrap();
         let params = json!({"terminalId":created["terminalId"]});

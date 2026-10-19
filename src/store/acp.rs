@@ -9,6 +9,36 @@ pub struct AcpSessionState {
 }
 
 impl Store {
+    pub(super) fn save_acp_session_state(
+        &self,
+        session_id: &str,
+        state: &AcpSessionState,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO acp_sessions (session_id, launch_json, configuration_json) VALUES (?1, ?2, ?3)",
+            params![session_id, serde_json::to_string(&state.launch)?, serde_json::to_string(&state.configuration)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn ensure_acp_session_state(&self, session_id: &str) -> Result<Option<AcpSessionState>> {
+        if let Some(state) = self.acp_session_state(session_id)? {
+            return Ok(Some(state));
+        }
+        let Some(session) = self.get_chat_session(session_id)? else {
+            return Ok(None);
+        };
+        if session.native_session_id.is_some() {
+            return Err(anyhow!(
+                "The ACP chat's saved launch configuration is missing"
+            ));
+        }
+        if let Some(state) = self.acp_launch_for_session(&session)? {
+            self.save_acp_session_state(session_id, &state)?;
+        }
+        self.acp_session_state(session_id)
+    }
+
     pub fn acp_session_state(&self, session_id: &str) -> Result<Option<AcpSessionState>> {
         let saved: Option<(String, String)> = self
             .conn

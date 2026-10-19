@@ -1666,6 +1666,9 @@ impl Store {
                     session.updated_at,
                 ],
             )?;
+            if let Some(state) = self.acp_launch_for_session(session)? {
+                self.save_acp_session_state(&session.id, &state)?;
+            }
         }
         for message in messages {
             tx.execute(
@@ -1926,10 +1929,7 @@ impl Store {
             ],
         )?;
         if let Some(state) = acp_state {
-            self.conn.execute(
-                "INSERT INTO acp_sessions (session_id, launch_json, configuration_json) VALUES (?1, ?2, ?3)",
-                params![s.id, serde_json::to_string(&state.launch)?, serde_json::to_string(&state.configuration)?],
-            )?;
+            self.save_acp_session_state(&s.id, &state)?;
         }
         if let Some(transaction) = transaction {
             transaction.commit()?;
@@ -4434,6 +4434,44 @@ mod tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn acp_first_turn_repairs_missing_state_without_redirecting_native_sessions() {
+        let dir = std::env::temp_dir().join(format!("orx-acp-repair-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut session = chat_session_fixture("legacy-demo");
+        session.harness = crate::local::acp::presets()[0].launch.id.clone();
+        store.create_chat_session(&session).unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE session_id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+        let repaired = store
+            .ensure_acp_session_state(&session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.launch.id, session.harness);
+        store
+            .conn
+            .execute(
+                "UPDATE chat_sessions SET native_session_id = 'native' WHERE id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE session_id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+        assert!(store.ensure_acp_session_state(&session.id).is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -1,6 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { nativeOptions, sessionAcpHarness, validAcpLaunch } from "../src/acp.ts";
+import { formatAcpCommand, nativeOptions, parseAcpCommand, sessionAcpHarness, validAcpLaunch } from "../src/acp.ts";
+
+test("a pasted ACP command preserves quoted paths and argument boundaries", () => {
+  assert.deepEqual(parseAcpCommand('kimi acp'), { executable: 'kimi', arguments: ['acp'] });
+  assert.deepEqual(parseAcpCommand('"/tmp/My Agent" --profile "two words" --empty \'\''), {
+    executable: '/tmp/My Agent', arguments: ['--profile', 'two words', '--empty', ''],
+  });
+  assert.deepEqual(parseAcpCommand('C:\\Tools\\agent.exe --acp'), { executable: 'C:\\Tools\\agent.exe', arguments: ['--acp'] });
+  assert.deepEqual(parseAcpCommand('agent --profile \\\n acp'), { executable: 'agent', arguments: ['--profile', 'acp'] });
+});
+
+test("saved launch configurations round trip without evaluating special characters", () => {
+  const executable = "/tmp/agent's folder/agent";
+  const args = ['two words', '"quoted"', "it's literal", '$HOME', '$(touch never)', '`touch never`', '', 'a; b', 'one\ntwo', 'C:\\Program Files\\agent'];
+  assert.deepEqual(parseAcpCommand(formatAcpCommand(executable, args)), { executable, arguments: args });
+});
+
+test("incomplete commands and shell operations cannot silently become a different launch", () => {
+  for (const command of ['', '   ', 'agent "unclosed', "agent 'unclosed", 'agent \\', 'agent | other', 'agent && other', 'agent; other', 'agent > output', 'agent < input', 'agent $(other)', 'agent $HOME', 'agent `other`', 'KEY=value agent', 'agent\nother', './agent --acp', 'agent "bad\0argument"']) {
+    assert.equal(parseAcpCommand(command), null, command);
+  }
+});
 
 test("native controls retain opaque IDs, grouped choices, and agent ordering", () => {
   const configuration = { configOptions: [
@@ -29,6 +50,14 @@ test("modern options take precedence and unsupported controls keep defaults", ()
   assert.deepEqual(nativeOptions({ configOptions: [], modes: { currentModeId: "plan", availableModes: [{ id: "plan", name: "Plan" }] } }), []);
   assert.deepEqual(nativeOptions(null), []);
   assert.equal(nativeOptions({ modes: { currentModeId: "ask", availableModes: [{ id: "ask", name: "Ask" }] } })[0].currentValue, "ask");
+});
+
+test("an uninitialized ACP chat uses the discovered catalog until native options arrive", () => {
+  const catalog = { id: "acp:stable-id", name: "Agent", models: [{ id: "a", displayName: "Model A" }, { id: "b", displayName: "Model B" }] };
+  const session = { harness: catalog.id, nativeConfiguration: {} };
+  assert.deepEqual(sessionAcpHarness(session, catalog).models, catalog.models);
+  session.nativeConfiguration = { models: { currentModelId: "c", availableModels: [{ modelId: "c", name: "Session Model" }] } };
+  assert.deepEqual(sessionAcpHarness(session, catalog).models.map((model) => model.id), ["c"]);
 });
 
 test("the settings form validates launch fields without interpreting argument boundaries", () => {

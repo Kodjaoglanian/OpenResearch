@@ -1735,7 +1735,10 @@ export interface Harness {
   agentReady: boolean;
   agentNote?: string;
   setupUrl?: string;
+  authEnvKey?: string;
   needsConnectionAdapter?: boolean;
+  adapterMissing?: boolean;
+  logo?: string;
   /** Setup is blocked by something no install/update/login command repairs —
    * an environment credential overriding the saved login, a database the CLI
    * will not open. `agentNote` carries the repair; offer no setup button. */

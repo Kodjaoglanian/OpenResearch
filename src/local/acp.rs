@@ -178,11 +178,16 @@ pub fn executable_path(executable: &str) -> Option<std::path::PathBuf> {
     }
     crate::local::shell_env::find_on_path(executable).or_else(|| {
         let home = dirs::home_dir()?;
-        [".local/bin", ".grok/bin", ".devin/bin"]
-            .iter()
-            .find_map(|directory| {
-                crate::local::shell_env::find_in_dir(&home.join(directory), executable)
-            })
+        [
+            ".local/bin",
+            ".grok/bin",
+            ".devin/bin",
+            ".zcode/runtime/bin",
+        ]
+        .iter()
+        .find_map(|directory| {
+            crate::local::shell_env::find_in_dir(&home.join(directory), executable)
+        })
     })
 }
 
@@ -287,9 +292,75 @@ pub async fn test_connection(definition: &Definition) -> Result<serde_json::Valu
     )
 }
 
+pub async fn discover_models(definition: &Definition) -> Result<serde_json::Value> {
+    let id = format!("acp-catalog-{}", uuid::Uuid::new_v4());
+    let cwd = std::env::temp_dir().join(&id);
+    let mut directory = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.create(&cwd)?;
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _directory = Directory(cwd.clone());
+    let client = host::spawn(definition, &cwd, &id, None).await?;
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client.request(
+            "session/new",
+            agent_client_protocol::schema::v1::NewSessionRequest::new(&cwd),
+        ),
+    )
+    .await;
+    // Discovery never sets session ownership, so delegated tools and approvals are rejected.
+    client.shutdown().await;
+    response.map_err(|_| crate::error::anyhow!("Loading the agent's models timed out"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn model_discovery_creates_session_without_prompting_or_delegated_tools() {
+        let peer = r#"
+import json, os, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion':1, 'agentCapabilities':{}}
+    elif method == 'session/new':
+        assert os.path.isabs(request['params']['cwd']), request
+        print(json.dumps({'jsonrpc':'2.0','id':'read','method':'fs/read_text_file','params':{'sessionId':'catalog','path':'/etc/hosts'}}), flush=True)
+        denied = json.loads(sys.stdin.readline())
+        assert 'error' in denied, denied
+        result = {'sessionId':'catalog','models':{'currentModelId':'one','availableModels':[{'modelId':'one','name':'One'},{'modelId':'two','name':'Two'}]}}
+    else:
+        raise AssertionError(method)
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}), flush=True)
+"#;
+        let definition = Definition {
+            id: format!("acp:{}", uuid::Uuid::new_v4()),
+            name: "Catalog peer".into(),
+            executable: if cfg!(windows) { "python" } else { "python3" }.into(),
+            arguments: vec!["-u".into(), "-c".into(), peer.into()],
+        };
+        let configuration = discover_models(&definition).await.unwrap();
+        assert_eq!(
+            configuration["models"]["availableModels"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn popular_agents_have_valid_stable_launchers() {

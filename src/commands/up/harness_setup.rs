@@ -40,6 +40,9 @@ fn windows_install_command(harness: &str) -> Option<&'static str> {
 /// uses, without its timeout and cleanup flags. Temp destination, since a
 /// relative path could clobber.
 fn install_command(harness: &str, windows: bool) -> Option<String> {
+    if let Some(package) = adapter_package(harness) {
+        return Some(format!("npm install -g {package}"));
+    }
     if windows {
         return windows_install_command(harness).map(str::to_string);
     }
@@ -47,6 +50,24 @@ fn install_command(harness: &str, windows: bool) -> Option<String> {
     Some(format!(
         "script=$(mktemp) && curl -fsSL {url} -o \"$script\" && {interpreter} \"$script\""
     ))
+}
+
+fn adapter_package(harness: &str) -> Option<&'static str> {
+    let definition = crate::local::acp::registered_definitions()
+        .into_iter()
+        .find(|definition| definition.id == harness)?;
+    let executable = std::path::Path::new(&definition.executable)
+        .file_name()?
+        .to_str()?;
+    let executable = executable
+        .strip_suffix(".cmd")
+        .or_else(|| executable.strip_suffix(".exe"))
+        .unwrap_or(executable);
+    match executable {
+        "pi-acp" => Some("pi-acp"),
+        "zcode-acp-server" => Some("zcode-acp-server"),
+        _ => None,
+    }
 }
 
 /// Fetch the bootstrap to a temp file, then run it with the PTY as stdin.
@@ -147,6 +168,14 @@ pub(super) async fn commands() -> Json<Value> {
             );
         }
     }
+    for definition in crate::local::acp::registered_definitions() {
+        if let Some(install) = install_command(&definition.id, cfg!(windows)) {
+            result.insert(
+                definition.id,
+                json!({"install": install, "login": "", "update": "", "requiresNpm": true}),
+            );
+        }
+    }
     Json(Value::Object(result))
 }
 
@@ -200,6 +229,9 @@ pub(super) async fn connect(
     // that is the table it renders from.
     if install_command(&request.harness, cfg!(windows)).is_none() {
         return bad_request("Unknown coding agent").into_response();
+    }
+    if adapter_package(&request.harness).is_some() && !matches!(request.action, Action::Install) {
+        return bad_request("ACP adapters only support installation here").into_response();
     }
     if request.trigger == Trigger::Automatic
         && (request.harness != "opencode" || !matches!(request.action, Action::Install))
@@ -314,11 +346,21 @@ async fn run(
             Action::Install => {
                 // The PTY is this shell's stdin, so the vendor script — and
                 // anything it launches — reads the real terminal.
-                let (url, interpreter) = unix_bootstrap(&request.harness).unwrap();
-                (
-                    "bash".to_string(),
-                    vec!["-c".into(), unix_install_script(url, interpreter)],
-                )
+                if adapter_package(&request.harness).is_some() {
+                    (
+                        "bash".to_string(),
+                        vec![
+                            "-c".into(),
+                            install_command(&request.harness, false).unwrap(),
+                        ],
+                    )
+                } else {
+                    let (url, interpreter) = unix_bootstrap(&request.harness).unwrap();
+                    (
+                        "bash".to_string(),
+                        vec!["-c".into(), unix_install_script(url, interpreter)],
+                    )
+                }
             }
             Action::Login | Action::Update => {
                 let Some(harness) = crate::local::harness::detect_harness(&request.harness).await
@@ -587,7 +629,7 @@ fn setup_verified(
     harness: Option<&crate::local::harness::HarnessInfo>,
 ) -> bool {
     let Some(h) = harness else { return false };
-    if !h.installed || h.install_broken {
+    if !h.installed || h.install_broken || h.adapter_missing {
         return false;
     }
     if request.trigger == Trigger::Automatic {
@@ -620,6 +662,17 @@ pub(super) fn append_output(output: &mut String, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn acp_adapter_install_commands_are_allowlisted() {
+        for preset in crate::local::acp::presets() {
+            let command = install_command(&preset.launch.id, false);
+            assert_eq!(command.is_some(), preset.needs_connection_adapter);
+            if let Some(command) = command {
+                assert_eq!(Some(command), install_command(&preset.launch.id, true));
+            }
+        }
+        assert!(install_command("acp:unconfigured", false).is_none());
+    }
     use super::*;
 
     #[test]
@@ -720,7 +773,10 @@ mod tests {
             agent_ready: false,
             agent_note: None,
             setup_url: None,
+            auth_env_key: None,
             needs_connection_adapter: false,
+            adapter_missing: false,
+            logo: None,
             needs_config_repair: false,
             supports_steering: false,
             catalog_pending: false,

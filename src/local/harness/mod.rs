@@ -615,7 +615,10 @@ pub fn chat_harness(id: &str) -> Option<Box<dyn Harness>> {
 
 pub fn session_harness(id: &str, session_id: &str) -> Option<Box<dyn Harness>> {
     if id.starts_with("acp:") {
-        let state = Store::open().ok()?.acp_session_state(session_id).ok()??;
+        let state = Store::open()
+            .ok()?
+            .ensure_acp_session_state(session_id)
+            .ok()??;
         return (state.launch.id == id)
             .then(|| Box::new(acp::Acp(state.launch)) as Box<dyn Harness>);
     }

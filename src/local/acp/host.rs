@@ -14,6 +14,7 @@ use crate::error::{anyhow, bail, Result};
 
 pub enum Event {
     Update(Value),
+    TerminalOutput { id: String, output: String },
     Permission { id: String, request: Value },
 }
 
@@ -477,14 +478,31 @@ impl Host {
     }
 }
 
-async fn spawn(
+pub(super) async fn spawn(
     definition: &Definition,
     cwd: &Path,
     session_id: &str,
     events: Option<tokio::sync::broadcast::Sender<(&'static str, Value)>>,
 ) -> Result<Arc<Client>> {
     definition.validate()?;
-    let mut command = tokio::process::Command::new(&definition.executable);
+    let zcode = Path::new(&definition.executable)
+        .file_stem()
+        .is_some_and(|name| name == "zcode-acp-server")
+        && definition.arguments.is_empty();
+    let mut command = if zcode {
+        let node = super::executable_path("node")
+            .ok_or_else(|| anyhow!("ZCode ACP requires Node.js on PATH"))?;
+        let executable = super::executable_path(&definition.executable)
+            .ok_or_else(|| anyhow!("ZCode ACP adapter is not installed"))?;
+        let mut command = tokio::process::Command::new(node);
+        command
+            .args(["-e", include_str!("zcode-runtime.cjs")])
+            .arg(executable)
+            .arg("--orx-launch");
+        command
+    } else {
+        tokio::process::Command::new(&definition.executable)
+    };
     command
         .args(&definition.arguments)
         .current_dir(cwd)
@@ -514,6 +532,17 @@ async fn spawn(
     );
     let io = Arc::new(SessionIo::default());
     let delegated = Arc::new(super::delegated::Delegated::new(cwd));
+    if Path::new(&definition.executable)
+        .file_stem()
+        .is_some_and(|name| name == "grok")
+        && definition
+            .arguments
+            .iter()
+            .map(String::as_str)
+            .eq(["agent", "stdio"])
+    {
+        delegated.set_agent("grok");
+    }
     let request_tools = delegated.clone();
     let notifications = io.clone();
     let chat_id = session_id.to_owned();
@@ -524,6 +553,7 @@ async fn spawn(
     let (stop_sender, stop_receiver) = oneshot::channel();
     let (closed_sender, closed_receiver) = tokio::sync::watch::channel(false);
     let task_io = io.clone();
+    let initialized_tools = delegated.clone();
     tokio::spawn(async move {
         let run = agent_client_protocol::Client
             .builder()
@@ -568,9 +598,18 @@ async fn spawn(
                     }
                     if request.method != "session/request_permission" {
                         let delegated = request_tools.clone();
+                        let terminal_io = requests.clone();
                         connection.spawn(async move {
+                            let terminal_id = request.params["terminalId"].as_str().map(str::to_owned);
+                            let final_output = if request.method == "terminal/release" {
+                                delegated.request("terminal/output", request.params.clone()).await.ok()
+                            } else { None };
                             match delegated.request(&request.method, request.params).await {
                                 Ok(response) => {
+                                    let output = final_output.as_ref().or_else(|| (request.method == "terminal/output").then_some(&response));
+                                    if let (Some(id), Some(output)) = (terminal_id, output.and_then(|value| value["output"].as_str())) {
+                                        terminal_io.emit(Event::TerminalOutput { id, output: output.to_owned() });
+                                    }
                                     let _ = responder.respond(response);
                                 }
                                 Err(error) => {
@@ -617,6 +656,9 @@ async fn spawn(
                 if initialized.protocol_version != ProtocolVersion::V1 {
                     return Err(agent_client_protocol::Error::invalid_params()
                         .data("Incompatible ACP protocol: stable v1 is required"));
+                }
+                if let Some(agent) = &initialized.agent_info {
+                    initialized_tools.set_agent(&agent.name);
                 }
                 if let Some(sender) = initialized_sender.lock().unwrap().take() {
                     let _ = sender.send(Ok((
@@ -780,7 +822,16 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(first_events.try_recv().is_ok());
+        let mut terminal_output = None;
+        while let Ok(event) = first_events.try_recv() {
+            if let Event::TerminalOutput { output, .. } = event {
+                terminal_output = Some(output);
+            }
+        }
+        let output =
+            terminal_output.expect("delegated terminal output reaches the transcript stream");
+        assert!(!output.is_empty() && output.len() <= 100);
+        assert!(second_events.try_recv().is_err());
         tokio::time::timeout(std::time::Duration::from_secs(5), prompt(&second, "hello"))
             .await
             .unwrap()

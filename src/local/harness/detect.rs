@@ -263,8 +263,14 @@ pub struct HarnessInfo {
     pub agent_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub setup_url: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_env_key: Option<&'static str>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub needs_connection_adapter: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub adapter_missing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
     /// Setup is blocked by something the harness's own install/login commands
     /// cannot repair — an environment credential that overrides the saved
     /// login, a database the CLI will not open. Signing in again or updating
@@ -309,7 +315,10 @@ impl HarnessInfo {
             agent_ready: false,
             agent_note: None,
             setup_url: None,
+            auth_env_key: None,
             needs_connection_adapter: false,
+            adapter_missing: false,
+            logo: None,
             needs_config_repair: false,
             supports_steering: false,
             catalog_pending: false,

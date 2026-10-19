@@ -191,7 +191,6 @@ import {
   defaultSelection,
   harnessLabel,
   ModelPicker,
-  OptionPicker,
   usePopover,
   type ModelSelection,
 } from "./ModelPicker";
@@ -7215,11 +7214,12 @@ export function ChatPanel({
                   onSelectAutonomy={setAutonomy}
                   lockHarness={!!openSession}
                   openRequest={modelPickerRequest}
+                  nativeOptions={openSession?.harness.startsWith("acp:") ? acpOptions.filter((option) => option.category !== "model") : []}
+                  onSelectNativeOption={(optionId, value) => {
+                    if (!openSession) return;
+                    void setChatConfiguration(openSession.id, optionId, value).catch((error: unknown) => showAlert(error instanceof Error ? error.message : String(error), "error"));
+                  }}
                 />
-                {openSession?.harness.startsWith("acp:") && acpOptions.filter((option) => option.category !== "model").map((option) => (
-                  <OptionPicker key={option.id} title={option.name} header={option.name} choices={option.choices} value={option.currentValue}
-                    onSelect={(value) => { void setChatConfiguration(openSession.id, option.id, value).catch((error: unknown) => showAlert(error instanceof Error ? error.message : String(error), "error")); }} />
-                ))}
                 <ContextMeter usage={openSession?.contextUsage} />
               </div>
               {busy && !pendingQuestion ? (

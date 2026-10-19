@@ -6266,7 +6266,7 @@ async fn openresearch_terminal(
     let program = crate::paths::spawnable_exe()
         .map(|exe| exe.to_string_lossy().into_owned())
         .map_err(anyhow::Error::from);
-    command_terminal(&headers, ws, program, args, false).await
+    command_terminal(&headers, ws, program, args, Vec::new(), false).await
 }
 
 /// Commands the settings page may run, keyed by the exact note text. The
@@ -6276,6 +6276,16 @@ const SETTINGS_COMMANDS: &[(&str, &[&str])] = &[
     ("gh auth login", &["gh", "auth", "login"]),
     ("hf auth login", &["hf", "auth", "login"]),
     ("claude auth status", &["claude", "auth", "status"]),
+    ("kimi login", &["kimi", "login"]),
+    (
+        "mcode login --region global",
+        &["mcode", "login", "--region", "global"],
+    ),
+    ("devin auth login", &["devin", "auth", "login"]),
+    ("grok login", &["grok", "login"]),
+    ("pi", &["pi"]),
+    ("zcode login zai", &["zcode", "login", "zai"]),
+    ("zcode login bigmodel", &["zcode", "login", "bigmodel"]),
 ];
 
 fn settings_command(command: &str) -> Option<&'static [&'static str]> {
@@ -6302,11 +6312,75 @@ async fn run_settings_command(
     let Some(argv) = settings_command(req.command.trim()) else {
         return bad_request("command is not runnable from settings").into_response();
     };
-    let program = local::shell_env::find_on_path(argv[0])
-        .map(|path| path.to_string_lossy().into_owned())
-        .ok_or_else(|| anyhow!("{} is not installed", argv[0]));
-    let args = argv[1..].iter().map(|arg| arg.to_string()).collect();
-    command_terminal(&headers, ws, program, args, true).await
+    let mut args: Vec<String> = argv[1..].iter().map(|arg| arg.to_string()).collect();
+    let mut env = Vec::new();
+    let program = if argv[0] == "zcode" && local::acp::executable_path("zcode").is_none() {
+        let mut candidates = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join("Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"));
+        }
+        candidates.push(std::path::PathBuf::from(
+            "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+        ));
+        if let Some(data) = dirs::data_local_dir() {
+            candidates.push(data.join("Programs/ZCode/resources/glm/zcode.cjs"));
+        }
+        match (
+            local::acp::executable_path("node"),
+            candidates.into_iter().find(|path| path.is_file()),
+        ) {
+            (Some(node), Some(cli)) => {
+                let home = local::shell_env::var("ZCODE_HOME")
+                    .or_else(|| {
+                        crate::config::synced_env_var("ZCODE_HOME").map(std::ffi::OsString::from)
+                    })
+                    .filter(|home| !home.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".zcode"));
+                env = zcode_provider_env(&cli, &home);
+                env.push(("ZCODE_HOME", home.into_os_string()));
+                args.insert(0, cli.to_string_lossy().into_owned());
+                Ok(node.to_string_lossy().into_owned())
+            }
+            _ => Err(anyhow!(
+                "ZCode CLI not found. Install ZCode and Node.js, then retry."
+            )),
+        }
+    } else {
+        local::acp::executable_path(argv[0])
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("{} is not installed", argv[0]))
+    };
+    command_terminal(&headers, ws, program, args, env, true).await
+}
+
+fn zcode_provider_env(
+    cli: &std::path::Path,
+    home: &std::path::Path,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let Some(directory) = cli.parent() else {
+        return Vec::new();
+    };
+    let provider = [
+        directory.join("provider/zcode-builtin.json"),
+        directory.join("../config/provider/zcode-builtin.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    let Some(provider) = provider else {
+        return Vec::new();
+    };
+    // ZCode uses the bundled table verbatim only when both paths are explicit.
+    vec![
+        (
+            "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+            provider.into_os_string(),
+        ),
+        (
+            "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+            home.join("v2/provider_config.json").into_os_string(),
+        ),
+    ]
 }
 
 /// The user's interactive login shell, so follow-up commands see the PATH a
@@ -6334,6 +6408,7 @@ async fn command_terminal(
     ws: WebSocketUpgrade,
     program: Result<String>,
     args: Vec<String>,
+    env: Vec<(&'static str, std::ffi::OsString)>,
     shell_after: bool,
 ) -> Response {
     if let Some(rejected) = reject_cross_origin(headers) {
@@ -6344,7 +6419,7 @@ async fn command_terminal(
         let _active = active;
         let mut size = DEFAULT_PTY_SIZE;
         let started = match program {
-            Ok(program) => spawn_pty(program, args, Vec::new(), size).await,
+            Ok(program) => spawn_pty(program, args, env, size).await,
             Err(error) => Err(error),
         };
         let session = match started {
@@ -9076,6 +9151,32 @@ mod tests {
     }
 
     #[test]
+    fn bundled_zcode_login_has_both_provider_paths() {
+        let root = std::env::temp_dir().join(format!("orx-zcode-login-{}", uuid::Uuid::new_v4()));
+        let cli = root.join("Resources/glm/zcode.cjs");
+        let provider = root.join("Resources/config/provider/zcode-builtin.json");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(provider.parent().unwrap()).unwrap();
+        std::fs::write(&provider, "{}").unwrap();
+        let home = root.join("test-home");
+        let env = zcode_provider_env(&cli, &home);
+        assert_eq!(env.len(), 2);
+        assert_eq!(
+            std::fs::canonicalize(&env[0].1).unwrap(),
+            std::fs::canonicalize(provider).unwrap()
+        );
+        assert_eq!(
+            env[1],
+            (
+                "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+                home.join("v2/provider_config.json").into_os_string()
+            )
+        );
+        assert!(zcode_provider_env(&root.join("missing/zcode.cjs"), &home).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn settings_commands_are_an_exact_allowlist() {
         assert_eq!(
             settings_command("gh auth login"),
@@ -9083,6 +9184,11 @@ mod tests {
         );
         assert_eq!(settings_command("gh auth login; rm -rf ~"), None);
         assert_eq!(settings_command("gh"), None);
+        assert_eq!(
+            settings_command("zcode login zai"),
+            Some(&["zcode", "login", "zai"][..])
+        );
+        assert_eq!(settings_command("zcode login zai; echo token"), None);
     }
 
     #[tokio::test]

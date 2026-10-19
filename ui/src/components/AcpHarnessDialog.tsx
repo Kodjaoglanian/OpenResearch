@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { Plus, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { saveAcpHarness, testAcpHarness, listAcpPresets, type AcpDefinition } from "../api";
 import { workspaceKey } from "../queries/client";
-import { validAcpLaunch } from "../acp";
+import { formatAcpCommand, parseAcpCommand, validAcpLaunch } from "../acp";
 import { m } from "../paraglide/messages.js";
 import { OptionPicker } from "./ModelPicker";
-import { Button, IconButton, Input } from "./ui";
+import { Button, Input } from "./ui";
 
 export function AcpHarnessDialog({ definition, onClose, onSaved }: {
   definition?: AcpDefinition;
@@ -17,8 +16,8 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
   const presets = useQuery({ queryKey: workspaceKey("getAcpPresets"), queryFn: listAcpPresets });
   const [preset, setPreset] = useState<string | null>(definition ? "custom" : null);
   const [name, setName] = useState(definition?.name ?? "");
-  const [executable, setExecutable] = useState(definition?.executable ?? "");
-  const [args, setArgs] = useState(definition?.arguments ?? []);
+  const [command, setCommand] = useState(definition ? formatAcpCommand(definition.executable, definition.arguments) : "");
+  const [commandTouched, setCommandTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [connected, setConnected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -27,15 +26,17 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
     dialog?.showModal();
     return () => dialog?.close();
   }, []);
-  const valid = validAcpLaunch(name, executable, args);
-  const launch = { name, executable, arguments: args };
+  const parsed = parseAcpCommand(command);
+  const valid = parsed !== null && validAcpLaunch(name, parsed.executable, parsed.arguments);
+  const invalidCommand = commandTouched && command.trim().length > 0 && !parsed;
+  const launch = parsed ? { name, ...parsed } : null;
   const changePreset = (id: string) => {
     const selected = presets.data?.find((option) => option.id === id);
     if (id !== "custom" && !selected) return;
     setPreset(id);
     setName(selected?.name ?? "");
-    setExecutable(selected?.executable ?? "");
-    setArgs(selected?.arguments ?? []);
+    setCommand(selected ? formatAcpCommand(selected.executable, selected.arguments) : "");
+    setCommandTouched(false);
     setConnected(null);
     setError(null);
   };
@@ -43,7 +44,7 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
     if (preset === null && presets.data?.[0]) changePreset(presets.data[0].id);
   }, [preset, presets.data]);
   const run = async (test: boolean) => {
-    if (busy || !valid) return;
+    if (busy || !valid || !launch) return;
     setBusy(true);
     setConnected(null);
     setError(null);
@@ -67,29 +68,26 @@ export function AcpHarnessDialog({ definition, onClose, onSaved }: {
       className="m-auto w-120 max-w-[calc(100vw_-_40px)] max-h-[calc(100vh_-_40px)] overflow-y-auto rounded-xl border border-border bg-background p-5 text-text shadow-modal backdrop:bg-modal-backdrop-light">
       <h2 id="acp-dialog-title" className="mb-4 text-lg font-medium">{definition ? m.acp_edit() : m.acp_add()}</h2>
       <form className="flex flex-col gap-3" onSubmit={(event) => { event.preventDefault(); void run(false); }}>
+        <div className="text-sm leading-snug text-subtext">{m.acp_description()}</div>
         <label className="flex flex-col gap-1 text-sm text-subtext">{m.acp_preset()}
           <OptionPicker variant="field" floating dropDown disabled={busy} choices={[...(presets.data ?? []).map((option) => ({ id: option.id, label: option.name })), { id: "custom", label: m.acp_custom() }]} value={preset} onSelect={changePreset} />
         </label>
-        {presets.isError && <p role="alert" className="text-sm text-accent-red">{m.harness_setup_load_failed()} <Button type="button" variant="ghost" onClick={() => void presets.refetch()}>{m.app_retry()}</Button></p>}
+        {presets.isError && <div role="alert" className="text-sm text-accent-red">{m.harness_setup_load_failed()} <Button type="button" variant="ghost" onClick={() => void presets.refetch()}>{m.app_retry()}</Button></div>}
         {preset !== null && <details open={preset === "custom"} key={preset} className="text-sm">
-        <summary className="cursor-pointer text-subtext">{m.acp_advanced()}</summary>
-        <div className="mt-3 flex flex-col gap-3">
+        <summary className={preset === "custom" ? "hidden" : "cursor-pointer text-subtext"}>{m.acp_advanced()}</summary>
+        <div className={`flex flex-col gap-3${preset === "custom" ? "" : " mt-3"}`}>
         <label className="flex flex-col gap-1 text-sm text-subtext">{m.acp_name()}<Input value={name} onChange={(event) => setName(event.target.value)} /></label>
-        <label className="flex flex-col gap-1 text-sm text-subtext">{m.acp_executable()}<Input value={executable} onChange={(event) => { setExecutable(event.target.value); setConnected(null); }} /></label>
-        <div className="flex flex-col gap-2">
-          <span className="text-sm text-subtext">{m.acp_arguments()}</span>
-          {args.map((argument, index) => <div key={index} className="flex items-center gap-2">
-            <Input aria-label={m.acp_argument({ number: String(index + 1) })} value={argument} onChange={(event) => { setArgs(args.map((value, position) => position === index ? event.target.value : value)); setConnected(null); }} />
-            <IconButton aria-label={m.chat_panel_remove()} onClick={() => { setArgs(args.filter((_, position) => position !== index)); setConnected(null); }}><X size={14} /></IconButton>
-          </div>)}
-          <Button type="button" size="small" className="self-start" onClick={() => { setArgs([...args, ""]); setConnected(null); }}><Plus size={14} />{m.acp_add_argument()}</Button>
+        <div className="flex flex-col gap-1">
+          <label className="flex flex-col gap-1 text-sm text-subtext">{m.acp_executable()}<Input placeholder="kimi acp" spellCheck={false} autoCapitalize="none" autoComplete="off" aria-describedby={invalidCommand ? "acp-command-error" : "acp-command-help"} aria-invalid={invalidCommand || undefined} value={command} onBlur={() => setCommandTouched(true)} onChange={(event) => { setCommand(event.target.value); setConnected(null); setError(null); }} /></label>
+          <div id="acp-command-help" className="text-sm leading-snug text-subtext">{m.acp_command_help()}</div>
+          {invalidCommand && <div id="acp-command-error" role="alert" className="text-sm text-accent-red">{m.acp_command_invalid()}</div>}
         </div>
         </div>
         </details>}
-        <p className="text-sm text-text">{m.acp_setup_help()} <a href={presets.data?.find((option) => option.id === preset)?.setupUrl ?? "https://agentclientprotocol.com/overview/agents"} target="_blank" rel="noreferrer" className="text-primary underline">{m.acp_setup_docs()}</a></p>
-        {definition && <p className="text-sm text-subtext">{m.acp_edit_help()}</p>}
-        {error && <p role="alert" className="text-sm text-accent-red">{error}</p>}
-        {connected !== null && <p role="status" className="text-sm text-accent-green">{m.settings_page_connected()}{connected ? ` · ${connected}` : ""}</p>}
+        <div className="text-sm"><a href={presets.data?.find((option) => option.id === preset)?.setupUrl ?? "https://agentclientprotocol.com/overview/agents"} target="_blank" rel="noreferrer" className="text-primary underline">{m.acp_setup_docs()}</a></div>
+        {definition && <div className="text-sm text-subtext">{m.acp_edit_help()}</div>}
+        {error && <div role="alert" className="text-sm text-accent-red">{error}</div>}
+        {connected !== null && <div role="status" className="text-sm text-accent-green">{m.settings_page_connected()}{connected ? ` · ${connected}` : ""}</div>}
         <div className="mt-2 flex flex-wrap justify-end gap-2">
           {preset === "custom" && <Button type="button" disabled={busy || !valid} onClick={() => void run(true)}>{m.acp_test()}</Button>}
           <Button type="button" onClick={onClose}>{m.settings_page_cancel()}</Button>
