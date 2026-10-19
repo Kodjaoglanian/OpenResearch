@@ -7799,9 +7799,22 @@ async fn set_chat_configuration(
     let saved = store
         .acp_session_state(&id)?
         .ok_or_else(|| bad_request("This chat is not an ACP session"))?;
+    let _reservation;
     let client = match state.chat.acp.connected(&id).await {
-        Ok(client) => client,
+        Ok(client) => {
+            _reservation = None;
+            client
+        }
         Err(_) => {
+            _reservation = Some(
+                local::chat::TurnGuard::claim(&state.chat, &id, None)
+                    .await
+                    .ok_or_else(|| {
+                        bad_request(
+                            "Chat is busy; try changing the option again after the turn finishes",
+                        )
+                    })?,
+            );
             let native_id = session.native_session_id.as_deref().ok_or_else(|| {
                 bad_request("Start the conversation before changing agent options")
             })?;

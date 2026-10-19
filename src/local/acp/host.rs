@@ -265,11 +265,22 @@ impl Client {
         method: &str,
         params: impl serde::Serialize + Send,
     ) -> Result<Value> {
-        Ok(self
+        let request = self
             .connection
             .send_request(UntypedMessage::new(method, params)?)
-            .block_task()
-            .await?)
+            .block_task();
+        if method == "session/prompt" {
+            return Ok(request.await?);
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(30), request).await {
+            Ok(response) => Ok(response?),
+            Err(_) => {
+                self.shutdown().await;
+                bail!(
+                    "ACP {method} timed out. Check the agent's connection and send a new message."
+                )
+            }
+        }
     }
 
     pub fn answer(&self, id: &str, selected: &str) -> Result<()> {
@@ -340,9 +351,14 @@ pub struct Host {
     clients: Mutex<HashMap<String, ClientSlot>>,
     reaper_started: std::sync::atomic::AtomicBool,
     events: Option<tokio::sync::broadcast::Sender<(&'static str, Value)>>,
+    up_port: std::sync::OnceLock<u16>,
 }
 
 impl Host {
+    pub fn set_up_port(&self, port: u16) {
+        let _ = self.up_port.set(port);
+    }
+
     pub fn new(events: tokio::sync::broadcast::Sender<(&'static str, Value)>) -> Self {
         Self {
             events: Some(events),
@@ -369,7 +385,14 @@ impl Host {
             *client.idle_since.lock().unwrap() = None;
             return Ok(client.clone());
         }
-        let client = spawn(definition, cwd, session_id, self.events.clone()).await?;
+        let client = spawn(
+            definition,
+            cwd,
+            session_id,
+            self.events.clone(),
+            self.up_port.get().copied(),
+        )
+        .await?;
         *client.idle_since.lock().unwrap() = None;
         *saved = Some(client.clone());
         Ok(client)
@@ -483,8 +506,12 @@ pub(super) async fn spawn(
     cwd: &Path,
     session_id: &str,
     events: Option<tokio::sync::broadcast::Sender<(&'static str, Value)>>,
+    up_port: Option<u16>,
 ) -> Result<Arc<Client>> {
     definition.validate()?;
+    let executable = super::executable_path(&definition.executable).ok_or_else(|| {
+        anyhow!("Executable not found. Install the agent or check its launch command.")
+    })?;
     let zcode = Path::new(&definition.executable)
         .file_stem()
         .is_some_and(|name| name == "zcode-acp-server")
@@ -492,8 +519,6 @@ pub(super) async fn spawn(
     let mut command = if zcode {
         let node = super::executable_path("node")
             .ok_or_else(|| anyhow!("ZCode ACP requires Node.js on PATH"))?;
-        let executable = super::executable_path(&definition.executable)
-            .ok_or_else(|| anyhow!("ZCode ACP adapter is not installed"))?;
         let mut command = tokio::process::Command::new(node);
         command
             .args(["-e", include_str!("zcode-runtime.cjs")])
@@ -501,7 +526,7 @@ pub(super) async fn spawn(
             .arg("--orx-launch");
         command
     } else {
-        tokio::process::Command::new(&definition.executable)
+        tokio::process::Command::new(executable)
     };
     command
         .args(&definition.arguments)
@@ -511,7 +536,9 @@ pub(super) async fn spawn(
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     crate::local::chat::prepare_env(&mut command);
-    command.env(crate::local::chat::CHAT_SESSION_ENV, session_id);
+    if up_port.is_some() {
+        crate::local::chat::set_chat_session_env(&mut command, session_id, &definition.id, up_port);
+    }
     #[cfg(unix)]
     command.process_group(0);
     let child = command.spawn().map_err(|error| {
@@ -531,7 +558,11 @@ pub(super) async fn spawn(
         process.child.stdout.take().expect("piped stdout").compat(),
     );
     let io = Arc::new(SessionIo::default());
-    let delegated = Arc::new(super::delegated::Delegated::new(cwd));
+    let mut delegated = super::delegated::Delegated::new(cwd);
+    if let Some(port) = up_port {
+        delegated.set_session(session_id, &definition.id, port);
+    }
+    let delegated = Arc::new(delegated);
     if Path::new(&definition.executable)
         .file_stem()
         .is_some_and(|name| name == "grok")
@@ -746,6 +777,43 @@ mod tests {
             .unwrap();
         client.set_native_id(response["sessionId"].as_str().unwrap());
         client
+    }
+
+    #[tokio::test]
+    async fn resident_process_receives_owning_chat_connection() {
+        let host = Arc::new(Host::default());
+        host.set_up_port(4901);
+        host.get(
+            "environment-chat",
+            &definition("environment"),
+            &std::env::temp_dir(),
+        )
+        .await
+        .unwrap();
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stalled_session_setup_times_out_and_stops_the_process() {
+        let host = Arc::new(Host::default());
+        let client = host
+            .get(
+                "stalled",
+                &definition("stalled-setup"),
+                &std::env::temp_dir(),
+            )
+            .await
+            .unwrap();
+        let error = client
+            .request(
+                "session/new",
+                json!({"cwd": std::env::temp_dir(), "mcpServers": []}),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session/new timed out"));
+        assert!(*client.closed.borrow());
+        host.stop("stalled").await;
     }
 
     async fn prompt(client: &Client, text: &str) -> Result<Value> {

@@ -42,6 +42,11 @@ for line in sys.stdin:
     method = request.get("method")
     params = request.get("params", {})
     if method == "initialize":
+        if mode == "environment":
+            assert os.environ["ORX_CHAT_SESSION_ID"] == "environment-chat"
+            assert os.environ["ORX_LOCAL_SESSION"] == "1"
+            assert os.environ["ORX_UP_PORT"] == "4901"
+            assert os.environ["ORX_CHAT_HARNESS"].startswith("acp:")
         assert params["clientCapabilities"]["fs"] == {"readTextFile": True, "writeTextFile": True}
         assert params["clientCapabilities"]["terminal"] is True
         if mode == "crash-init":
@@ -53,6 +58,8 @@ for line in sys.stdin:
                                 agentInfo=dict(name="Deterministic ACP peer", version="1.0"),
                                 agentCapabilities=dict(loadSession=mode != "no-resume", **({"sessionCapabilities": {"resume": {}}} if mode == "resume" else {}))))
     elif method == "session/new":
+        if mode == "stalled-setup":
+            continue
         reply(request, dict(sessionId=session, configOptions=config()))
     elif method in ["session/load", "session/resume"]:
         if mode == "missing":

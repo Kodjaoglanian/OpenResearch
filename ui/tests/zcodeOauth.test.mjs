@@ -42,6 +42,24 @@ test('expiry and provider rejection fail without leaking credentials', async () 
   await assert.rejects(requestAuth({token: 'private-secret'}, async () => ({ok: false, status: 429, json: async () => ({code: 1113, message: 'private-secret'})})), /Check your Z.ai account/);
 });
 
+test('Windows npm launchers resolve to the package JavaScript entry and preserve fallback launches', () => {
+  const root = mkdtempSync(join(tmpdir(), 'orx-zcode-npm-'));
+  try {
+    const pkg = join(root, 'node_modules', 'zcode-acp-server');
+    mkdirSync(join(pkg, 'dist'), {recursive: true});
+    writeFileSync(join(pkg, 'package.json'), JSON.stringify({name:'zcode-acp-server', version:'9.0.0', bin:{'zcode-acp-server':'dist/cli.js'}}));
+    const entry = join(pkg, 'dist', 'cli.js');
+    writeFileSync(entry, "process.stdout.write('npm adapter ready')");
+    const launcher = join(root, 'zcode-acp-server.cmd');
+    writeFileSync(launcher, '@echo off');
+    assert.equal(runtime.adapterEntry(launcher), entry);
+    const script = readFileSync(new URL('../../src/local/acp/zcode-runtime.cjs', import.meta.url), 'utf8');
+    assert.equal(execFileSync(process.execPath, ['-e', script, launcher, '--orx-launch'], {encoding:'utf8'}), 'npm adapter ready');
+  } finally {
+    rmSync(root, {recursive:true});
+  }
+});
+
 test('launcher preserves the ACP adapter while repairing account snapshot and runtime headers', () => {
   const root = mkdtempSync(join(tmpdir(), 'orx-zcode-oauth-'));
   const dist = join(root, 'dist');

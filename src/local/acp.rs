@@ -295,13 +295,13 @@ pub async fn test_connection(definition: &Definition) -> Result<serde_json::Valu
 pub async fn discover_models(definition: &Definition) -> Result<serde_json::Value> {
     let id = format!("acp-catalog-{}", uuid::Uuid::new_v4());
     let cwd = std::env::temp_dir().join(&id);
-    let mut directory = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        directory.mode(0o700);
+        std::fs::DirBuilder::new().mode(0o700).create(&cwd)?;
     }
-    directory.create(&cwd)?;
+    #[cfg(not(unix))]
+    std::fs::create_dir(&cwd)?;
     struct Directory(std::path::PathBuf);
     impl Drop for Directory {
         fn drop(&mut self) {
@@ -309,7 +309,7 @@ pub async fn discover_models(definition: &Definition) -> Result<serde_json::Valu
         }
     }
     let _directory = Directory(cwd.clone());
-    let client = host::spawn(definition, &cwd, &id, None).await?;
+    let client = host::spawn(definition, &cwd, &id, None, None).await?;
     let response = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         client.request(

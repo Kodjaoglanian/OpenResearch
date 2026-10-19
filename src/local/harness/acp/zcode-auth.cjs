@@ -1,9 +1,9 @@
-const {realpathSync, readFileSync} = require('node:fs');
+const {readFileSync} = require('node:fs');
 const {dirname, join} = require('node:path');
 const {pathToFileURL} = require('node:url');
 const oauthAccountForAuth = module.exports.oauthAccount;
 async function check() {
-  const dist = dirname(realpathSync(process.argv[1]));
+  const dist = dirname(module.exports.adapterEntry(process.argv[1]));
   const utils = await import(pathToFileURL(join(dist, 'utils.js')).href);
   for (const path of [utils.ZCODE_CREDS_PATH, utils.zcodePersonalProviderPath()]) {
     try { JSON.parse(readFileSync(path, 'utf8')); }

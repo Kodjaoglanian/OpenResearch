@@ -87,6 +87,7 @@ pub struct Delegated {
     cwd: PathBuf,
     terminals: Mutex<HashMap<String, Arc<Terminal>>>,
     shell_commands: AtomicBool,
+    session: Option<(String, String, u16)>,
 }
 
 impl Delegated {
@@ -95,12 +96,17 @@ impl Delegated {
             cwd: cwd.to_owned(),
             terminals: Mutex::new(HashMap::new()),
             shell_commands: AtomicBool::new(false),
+            session: None,
         }
     }
 
     pub fn set_agent(&self, name: &str) {
         self.shell_commands
             .store(matches!(name, "affogato" | "grok"), Ordering::Relaxed);
+    }
+
+    pub fn set_session(&mut self, session_id: &str, harness: &str, port: u16) {
+        self.session = Some((session_id.to_owned(), harness.to_owned(), port));
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -204,6 +210,14 @@ impl Delegated {
         crate::local::chat::prepare_env(&mut command);
         for variable in request.env {
             command.env(variable.name, variable.value);
+        }
+        if let Some((session_id, harness, port)) = &self.session {
+            crate::local::chat::set_chat_session_env(
+                &mut command,
+                session_id,
+                harness,
+                Some(*port),
+            );
         }
         #[cfg(unix)]
         command.process_group(0);
@@ -342,10 +356,11 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_arguments_environment_and_cancellation_are_preserved() {
-        let delegated = Delegated::new(&std::env::temp_dir());
+        let mut delegated = Delegated::new(&std::env::temp_dir());
+        delegated.set_session("terminal-chat", "acp:test", 4901);
         delegated.set_agent("grok");
         let python = if cfg!(windows) { "python" } else { "python3" };
-        let created = delegated.request("terminal/create", json!({"sessionId":"s", "command":python, "args":["-c", "import os,sys;print(sys.argv[1]);print(os.environ['ACP_TEST_VALUE']);sys.stdout.flush();import time;time.sleep(60)", "two words \"quoted\" $(untouched)"], "env":[{"name":"ACP_TEST_VALUE", "value":"native value"}]})).await.unwrap();
+        let created = delegated.request("terminal/create", json!({"sessionId":"s", "command":python, "args":["-c", "import os,sys;assert os.environ['ORX_CHAT_SESSION_ID']=='terminal-chat';assert os.environ['ORX_CHAT_HARNESS']=='acp:test';assert os.environ['ORX_LOCAL_SESSION']=='1';assert os.environ['ORX_UP_PORT']=='4901';print(sys.argv[1]);print(os.environ['ACP_TEST_VALUE']);sys.stdout.flush();import time;time.sleep(60)", "two words \"quoted\" $(untouched)"], "env":[{"name":"ACP_TEST_VALUE", "value":"native value"}, {"name":"ORX_CHAT_SESSION_ID", "value":"wrong-chat"}]})).await.unwrap();
         let params = json!({"terminalId":created["terminalId"]});
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

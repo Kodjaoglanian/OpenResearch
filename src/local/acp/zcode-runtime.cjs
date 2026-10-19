@@ -50,11 +50,21 @@ async function requestAuth(account, request = fetch) {
   return {apiKey: token, apiKeyId: key.apiKey};
 }
 
+function adapterEntry(executable) {
+  if (!/\.(cmd|ps1)$/i.test(executable)) return realpathSync(executable);
+  const root = join(dirname(executable), 'node_modules', 'zcode-acp-server');
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+  const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.['zcode-acp-server'];
+  if (!bin) throw new Error('ZCode ACP adapter has no JavaScript launcher. Reinstall the adapter.');
+  return join(root, bin);
+}
+
 async function launch(executable) {
-  const dist = dirname(realpathSync(executable));
+  const entry = adapterEntry(executable);
+  const dist = dirname(entry);
   const pkg = JSON.parse(readFileSync(join(dist, '..', 'package.json'), 'utf8'));
   if (pkg.name !== 'zcode-acp-server' || !['0.69.2', '0.69.3'].includes(pkg.version)) {
-    const child = require('node:child_process').spawn(executable, [], {stdio: 'inherit'});
+    const child = require('node:child_process').spawn(process.execPath, [entry], {stdio: 'inherit'});
     child.on('exit', code => { process.exitCode = code ?? 1; });
     return;
   }
@@ -114,7 +124,7 @@ async function launch(executable) {
   await (await load('index.js')).main();
 }
 
-module.exports = {oauthAccount, requestAuth};
+module.exports = {oauthAccount, requestAuth, adapterEntry};
 if (process.argv[2] === '--orx-launch') launch(process.argv[1]).catch(error => {
   process.stderr.write(`ZCode ACP startup failed: ${error.message}\n`);
   process.exitCode = 1;

@@ -3127,7 +3127,7 @@ mod persisted_queue_delay_tests {
 /// isn't already busy — closing the check-then-insert race. On drop (early
 /// error / panic) it clears the reservation; call `defuse` once the real abort
 /// handle has replaced it so the running turn's slot survives.
-struct TurnGuard {
+pub(crate) struct TurnGuard {
     host: Arc<ChatHost>,
     session_id: String,
     armed: bool,
@@ -3154,7 +3154,7 @@ impl TurnGuard {
     }
 
     /// `Some` if the slot was free and is now reserved; `None` if already busy.
-    async fn claim(
+    pub(crate) async fn claim(
         host: &Arc<ChatHost>,
         session_id: &str,
         overrides: Option<&mut TurnOverrides>,
@@ -3409,6 +3409,7 @@ impl ChatHost {
         let _ = self.up_port.set(port);
         self.opencode.set_up_port(port);
         self.codex.set_up_port(port);
+        self.acp.set_up_port(port);
     }
 
     /// The bound `orx up` port, if this host runs under a server (None in
