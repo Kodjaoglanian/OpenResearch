@@ -5,7 +5,7 @@ import { useVirtualizer, defaultRangeExtractor, type Range as VirtualRange } fro
 import { markLiveUpdate } from "../queries/live";
 import { removeSession as removeCachedSession } from "../queries/invalidation";
 import { nativeOptions, sessionAcpHarness } from "../acp";
-import { setChatConfiguration } from "../api";
+import { setChatConfiguration, timeAgo } from "../api";
 import {
   isCurrentScope,
   setScopedQueryData,
@@ -68,6 +68,7 @@ import {
   SquareTerminal,
   ToggleRight,
   TriangleAlert,
+  Trash2,
   Users,
   WifiOff,
   X,
@@ -191,6 +192,7 @@ import {
   defaultSelection,
   harnessLabel,
   ModelPicker,
+  OptionPicker,
   usePopover,
   type ModelSelection,
 } from "./ModelPicker";
@@ -3918,6 +3920,33 @@ type SessionFilter = "active" | "archived" | "all";
 const matchesFilter = (filter: SessionFilter, archived: boolean) =>
   filter === "all" ? true : filter === "archived" ? archived : !archived;
 
+function SideChatPicker({ parentId, sessions, onSelect, onCreate }: {
+  parentId: string;
+  sessions: ChatSession[];
+  onSelect: (sessionId: string) => void;
+  onCreate: () => void;
+}) {
+  const children = sessions.filter((session) => session.sideParentSessionId === parentId)
+    .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
+  return <OptionPicker
+    triggerLabel={m.side_chat_list({ count: children.length })}
+    choices={children.map((session) => ({
+      id: session.id,
+      label: session.title?.trim() || m.side_chat_untitled(),
+      description: timeAgo(session.updatedAt),
+    }))}
+    value=""
+    dropDown
+    align="right"
+    searchPlaceholder={m.side_chat_search()}
+    menuAction={{ label: m.side_chat_new(), onSelect: onCreate }}
+    renderLabel={(choice) => <span className="block max-w-60 truncate">{choice.label}</span>}
+    renderIcon={(choice) => children.find((session) => session.id === choice.id)?.busy
+      ? <Spinner /> : <MessagesSquare size={14} />}
+    onSelect={onSelect}
+  />;
+}
+
 /** Whether an event target sits inside the side-chat pane. */
 function inSideChat(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest("[data-side-chat]") !== null;
@@ -4274,6 +4303,7 @@ export function ChatPanel({
   onPreferredAutonomyChange,
   embedded = false,
   onOpenSideChat,
+  onSelectSideChat,
   onRunSetup,
   children,
 }: {
@@ -4347,6 +4377,7 @@ export function ChatPanel({
   embedded?: boolean;
   /** Branch a side chat off `parentSessionId`; a question, if given, is its first message. */
   onOpenSideChat?: (parentSessionId: string, question: string) => void;
+  onSelectSideChat?: (sessionId: string) => void;
   /** Middle-pane content when a settings section is active. */
   children?: React.ReactNode;
 }) {
@@ -6469,7 +6500,7 @@ export function ChatPanel({
     </aside>
   );
 
-  const headerClass = `chat-header flex items-center gap-2 py-0 px-4 bg-background shrink-0 h-12 relative z-4 w-full max-w-readable my-0 mx-auto [&::after]:content-[''] [&::after]:absolute [&::after]:top-full [&::after]:start-0 [&::after]:end-0 [&::after]:h-6 [&::after]:bg-[linear-gradient(to_bottom,_var(--base),_transparent)] [&::after]:pointer-events-none`;
+  const headerClass = `chat-header flex items-center gap-2 py-0 px-4 bg-background shrink-0 h-12 relative z-20 w-full max-w-readable my-0 mx-auto [&::after]:content-[''] [&::after]:absolute [&::after]:top-full [&::after]:start-0 [&::after]:end-0 [&::after]:h-6 [&::after]:bg-[linear-gradient(to_bottom,_var(--base),_transparent)] [&::after]:pointer-events-none`;
   const railReopen = !railOpen && !embedded && (
     <IconButton
       title={m.chat_panel_show_sidebar()}
@@ -6521,6 +6552,19 @@ export function ChatPanel({
               </span>
             </>}
           </div>
+          {!embedded && activeSession && onSelectSideChat && onOpenSideChat && (
+            <SideChatPicker
+              parentId={activeSession.id}
+              sessions={sessions}
+              onSelect={onSelectSideChat}
+              onCreate={() => onOpenSideChat(activeSession.id, "")}
+            />
+          )}
+          {embedded && activeSession && (
+            <IconButton aria-label={m.side_chat_delete()} data-tip={m.side_chat_delete()} onClick={() => void removeSession(activeSession)}>
+              <Trash2 size={15} />
+            </IconButton>
+          )}
           {onOpenDemoWelcome && (
             <IconButton
               data-tip={m.chat_panel_about_this_demo()}

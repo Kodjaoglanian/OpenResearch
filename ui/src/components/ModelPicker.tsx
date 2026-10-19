@@ -565,6 +565,8 @@ export function ModelPicker({
  * with a "· Default" note, then the full numbered list. */
 export function OptionPicker({
   triggerIcon,
+  triggerLabel,
+  menuAction,
   choices,
   value,
   defaultId,
@@ -583,6 +585,8 @@ export function OptionPicker({
   className,
 }: {
   triggerIcon?: ReactNode;
+  triggerLabel?: ReactNode;
+  menuAction?: { label: string; onSelect: () => void };
   choices: OptionChoice[];
   value: string | null;
   /** The harness's default id — pinned at top of the menu and used when
@@ -637,7 +641,7 @@ export function OptionPicker({
       window.removeEventListener("scroll", position, true);
     };
   }, [open, floating, dropDown, filter, choices.length, ref]);
-  if (choices.length === 0) return null;
+  if (choices.length === 0 && !menuAction) return null;
 
   const effectiveId = value ?? defaultId ?? choices[0]?.id ?? null;
   const current = choices.find((c) => c.id === effectiveId);
@@ -692,8 +696,8 @@ export function OptionPicker({
         onClick={() => { setFilter(""); setOpen((v) => !v); }}
       >
         <span className="inline-flex min-w-0 items-center gap-2">
-          {current && renderIcon?.(current)}
-          <span className="truncate">{current ? renderLabel?.(current) ?? label : label}</span>
+          {triggerLabel === undefined && current && renderIcon?.(current)}
+          <span className="truncate">{triggerLabel ?? (current ? renderLabel?.(current) ?? label : label)}</span>
         </span>
         <ChevronDown size={12} />
       </button>
@@ -703,6 +707,11 @@ export function OptionPicker({
           style={floating ? { position: "fixed", inset: "auto", margin: 0 } : undefined}
           className={`option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 ${choices.some((choice) => choice.description) ? "min-w-80" : ""} ${variant === "field" ? "min-w-full text-text" : ""} ${align === "right" ? "align-right" : ""} ${dropDown ? "drop-down" : ""}`}>
           {header && <div className={MODEL_GROUP_CLASS_NAME}>{header}</div>}
+          {menuAction && <MenuItem type="button" onClick={() => {
+            setOpen(false);
+            buttonRef.current?.focus();
+            menuAction.onSelect();
+          }}><span className="flex items-center gap-2"><Plus size={14} />{menuAction.label}</span></MenuItem>}
           {searchPlaceholder && <input autoFocus aria-label={searchPlaceholder} placeholder={searchPlaceholder} value={filter} onChange={(e) => setFilter(e.target.value)} className="shrink-0 border-b border-border bg-background px-2 py-2 text-sm outline-none" />}
           <div className="min-h-0 overflow-y-auto">
           {pinned && (

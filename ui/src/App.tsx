@@ -1,5 +1,6 @@
 import {
   setScopedQueryData,
+  deletedSessionIds,
   queryClient,
 } from "./queries/client";
 import { useMutation, useQuery } from "@tanstack/react-query";
@@ -17,7 +18,7 @@ import {
 
 import { listChatSessionsQuery, getChatMessagesQuery } from "./queries/chat";
 import { listProjectsQuery, getUiStateQuery, listRunsQuery, listExperimentsQuery } from "./queries/projects";
-import { deleteChatSession, openSideChat, sendChatMessage, setExperimentArchived } from "./api";
+import { openSideChat, sendChatMessage, setExperimentArchived } from "./api";
 import { getArtifactsQuery } from "./queries/files";
 import { readHarnesses } from "./queries/settings";
 import { useBlocker, useRouter, useRouterState } from "@tanstack/react-router";
@@ -1295,7 +1296,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [forgetRightTab, rightTab, sideTabs],
   );
 
-  // Side chats are deleted when orx restarts; drop saved tabs whose chat is gone.
+  // Drop saved tabs only when their persisted session has been deleted.
   useEffect(() => {
     const live = sessionsQuery.data;
     if (!live) return;
@@ -1310,16 +1311,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       showAlert(m.side_chat_open_failed({ error: errorText(error) }), "error");
       return;
     }
-    // The user moved to another task while it opened; its tab belongs nowhere now.
-    if (navigationRef.current.activeSessionId !== parentSessionId) {
-      void deleteChatSession(session.id).catch((error) => {
-        showAlert(m.side_chat_close_failed({ error: errorText(error) }), "error");
-      });
-      return;
-    }
+    if (deletedSessionIds.has(session.id) || deletedSessionIds.has(parentSessionId)) return;
     setScopedQueryData(listChatSessionsQuery(session.projectId).queryKey, (current) =>
       current && [session, ...current.filter((row) => row.id !== session.id)]);
-    openSideTab(session.id);
+    if (navigationRef.current.activeSessionId === parentSessionId) openSideTab(session.id);
     if (!question) return;
     try {
       // Seed the transcript first so the live stream has a cache to land the question in.
@@ -1330,16 +1325,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     }
   }, [openSideTab]);
 
-  // Side chats are temporary: closing the tab is what deletes one.
-  const closeSideTab = useCallback(
-    (tab: SideChatViewDef) => {
-      forgetSideTab(tab);
-      void deleteChatSession(tab.sessionId).catch((error) => {
-        showAlert(m.side_chat_close_failed({ error: errorText(error) }), "error");
-      });
-    },
-    [forgetSideTab],
-  );
+  const closeSideTab = forgetSideTab;
 
   // Live title + running state for open sub-agent tabs, straight off the spawn
   // parts' message stream — so a tab is named for its task and shimmers while
@@ -1776,6 +1762,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             onOpenPlan={openPlanTab}
             onOpenSubagent={openSubagentTab}
             onOpenSideChat={(parentSessionId, question) => void startSideChat(parentSessionId, question)}
+            onSelectSideChat={openSideTab}
             onRunSetup={runtime.kind === "ssh" ? undefined : runSetup}
             composerFocusNonce={composerFocusNonce}
             runtime={runtime}

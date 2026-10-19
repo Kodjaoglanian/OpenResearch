@@ -174,7 +174,7 @@ export interface SubagentViewDef {
   label?: string;
 }
 
-/** A temporary side chat branched off the task's chat, live beside it. */
+/** A persistent side chat branched off the task's chat, live beside it. */
 export interface SideChatViewDef {
   kind: "side";
   sessionId: string;
