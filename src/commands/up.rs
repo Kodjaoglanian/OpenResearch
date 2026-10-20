@@ -6004,7 +6004,7 @@ async fn ssh_connect_socket(
     backend: SshConnectBackend,
     target: crate::jobs::ssh::SshTarget,
 ) {
-    let connection = match crate::jobs::ssh::interactive_args(&target, None).await {
+    let connection = match crate::jobs::ssh::interactive_args(&target, None, None).await {
         Ok(connection) => connection,
         Err(error) => {
             send_ssh_connect_error(&mut socket, &host, backend, error.to_string()).await;
@@ -6107,15 +6107,14 @@ async fn ssh_run_socket(
     target: crate::jobs::ssh::SshTarget,
     command: String,
 ) {
-    let connection = match crate::jobs::ssh::interactive_args(&target, None).await {
+    let connection = match crate::jobs::ssh::interactive_args(&target, None, Some(command)).await {
         Ok(connection) => connection,
         Err(error) => {
             send_ws_error(&mut socket, error.to_string()).await;
             return;
         }
     };
-    let mut args = connection.args.clone();
-    args.push(command);
+    let args = connection.args.clone();
     let session = match tokio::task::spawn_blocking(move || start_pty("ssh", args)).await {
         Ok(Ok(session)) => session,
         Ok(Err(error)) => {
