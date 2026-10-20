@@ -164,14 +164,6 @@ pub async fn run(args: UpArgs) -> Result<()> {
         let gate = state.data_dir_gate.clone();
         tokio::task::spawn_blocking(move || local::demo::prewarm(move_in_progress, gate));
     }
-    if !persistent_host {
-        let chat = state.chat.clone();
-        tokio::spawn(async move {
-            if let Err(err) = local::chat::delete_side_chats(&chat).await {
-                eprintln!("orx up: side chat cleanup: {err}");
-            }
-        });
-    }
     // Deliver explicitly registered run wake-ups once their chat becomes idle.
     tokio::spawn(local::chat::watch_runs(
         state.chat.clone(),
@@ -278,6 +270,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     agent.shutdown().await;
     codex.shutdown().await;
     claude.shutdown().await;
+    state.chat.acp.shutdown().await;
     if let Some(server) = control_server {
         server.shutdown().await;
     }
@@ -537,6 +530,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route("/api/projects/{id}/github/push", post(push_project_github))
         .route("/api/github/account", get(github_account))
+        .route("/api/github/organizations", get(github_organizations))
         .route(
             "/api/github/project-repo-preview",
             get(github_project_repo_preview),
@@ -708,6 +702,8 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
             get(ray_settings).post(set_ray_settings),
         )
         .route("/api/settings/ray/preflight", post(ray_preflight))
+        .route("/api/settings/trackio", get(trackio_settings))
+        .route("/api/settings/trackio/preflight", post(trackio_preflight))
         .route("/api/settings/compute", get(compute_settings))
         .route("/api/settings/compute/default", post(set_compute_default))
         .route("/api/settings/local", get(local_machine_settings))
@@ -723,6 +719,16 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
             get(lit_sources_settings).post(set_lit_sources_settings),
         )
         .route("/api/harnesses", get(list_harnesses))
+        .route(
+            "/api/harnesses/acp",
+            get(list_acp_harnesses).post(create_acp_harness),
+        )
+        .route("/api/harnesses/acp/test", post(test_acp_harness))
+        .route("/api/harnesses/acp/presets", get(list_acp_presets))
+        .route(
+            "/api/harnesses/acp/{id}",
+            axum::routing::put(update_acp_harness).delete(delete_acp_harness),
+        )
         .route("/api/harnesses/{id}/snapshot", get(harness_snapshot))
         .route(
             "/api/harnesses/setup/commands",
@@ -759,9 +765,15 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         )
         .route(
             "/api/chat/sessions/{id}",
-            axum::routing::delete(delete_chat_session).patch(update_chat_session),
+            get(get_chat_session)
+                .delete(delete_chat_session)
+                .patch(update_chat_session),
         )
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
+        .route(
+            "/api/chat/sessions/{id}/configuration",
+            post(set_chat_configuration),
+        )
         .route("/api/chat/sessions/{id}/worktree", get(session_worktree))
         .route("/api/chat/sessions/{id}/message", post(send_chat_message))
         .route("/api/chat/sessions/{id}/shell", post(run_shell_command))
@@ -1555,7 +1567,7 @@ async fn create_project(
         .ok_or_else(|| bad_request("project deletion is in progress"))?;
     drop(create_admission);
     let (project, github_publication_error) = if github_sync_enabled {
-        match push_project_for_sync(project.clone(), &state.chat).await {
+        match push_project_for_sync(project.clone(), &state.chat, None).await {
             Ok((project, _)) => (project, None),
             Err(error) => {
                 let project = Store::open()?
@@ -1713,6 +1725,7 @@ fn github_push_was_rejected(error: &str) -> bool {
 async fn create_independent_project_repository(
     mut project: local::model::LocalProject,
     chat: &ChatHost,
+    organization: Option<&str>,
 ) -> Result<local::model::LocalProject> {
     let store = Store::open()?;
     let legacy = store
@@ -1735,7 +1748,7 @@ async fn create_independent_project_repository(
     let reroot_shallow = local::git::prepare_shallow_repository_for_publication(
         std::path::Path::new(&project.repo_path),
     )?;
-    let (owner, repo) = local::github::create_project_repo(&project.slug).await?;
+    let (owner, repo) = local::github::create_project_repo(&project.slug, organization).await?;
     if reroot_shallow {
         local::git::reroot_shallow_repository(
             std::path::Path::new(&project.repo_path),
@@ -1753,6 +1766,7 @@ async fn create_independent_project_repository(
 async fn push_project_for_sync(
     mut project: local::model::LocalProject,
     chat: &ChatHost,
+    organization: Option<&str>,
 ) -> Result<(local::model::LocalProject, local::github::Status)> {
     let github_status = local::github::status().await;
     if !github_status.installed {
@@ -1770,11 +1784,11 @@ async fn push_project_for_sync(
             .await?
             .is_some_and(|meta| meta.can_push && !meta.archived);
         if !can_push {
-            project = create_independent_project_repository(project, chat).await?;
+            project = create_independent_project_repository(project, chat, organization).await?;
             using_existing_repository = false;
         }
     } else {
-        project = create_independent_project_repository(project, chat).await?;
+        project = create_independent_project_repository(project, chat, organization).await?;
         using_existing_repository = false;
     }
 
@@ -1790,7 +1804,7 @@ async fn push_project_for_sync(
         if !using_existing_repository || !github_push_was_rejected(&error.to_string()) {
             return Err(error);
         }
-        project = create_independent_project_repository(project, chat).await?;
+        project = create_independent_project_repository(project, chat, organization).await?;
         push_once(&project)
             .await
             .map_err(|error| anyhow!("Git push task failed: {error}"))??;
@@ -1801,7 +1815,17 @@ async fn push_project_for_sync(
     Ok((project, github_status))
 }
 
-async fn enable_project_github(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnableProjectGithubReq {
+    organization: Option<String>,
+}
+
+async fn enable_project_github(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<EnableProjectGithubReq>,
+) -> ApiResult {
     reject_if_moving(&state)?;
     let _admission = state
         .project_lifecycle
@@ -1813,7 +1837,12 @@ async fn enable_project_github(State(state): State<AppState>, Path(id): Path<Str
     let project = store
         .get_local_project(&id)?
         .ok_or_else(|| not_found("project"))?;
-    let (project, github_status) = push_project_for_sync(project, &state.chat)
+    let organization = req
+        .organization
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (project, github_status) = push_project_for_sync(project, &state.chat, organization)
         .await
         .map_err(bad_request)?;
     let git_status = project_git_json(&project, github_status);
@@ -1875,6 +1904,13 @@ async fn github_account() -> ApiResult {
     Ok(Json(
         json!({ "login": local::github::viewer_login().await.ok() }),
     ))
+}
+
+async fn github_organizations() -> ApiResult {
+    let organizations = local::github::viewer_organizations()
+        .await
+        .map_err(bad_request)?;
+    Ok(Json(json!({ "organizations": organizations })))
 }
 
 #[derive(Deserialize)]
@@ -2036,6 +2072,7 @@ async fn delete_project(State(state): State<AppState>, Path(id): Path<String>) -
         state.chat.opencode.kill_session(&session.id).await;
         state.chat.codex.kill_session(&session.id).await;
         state.chat.claude.forget_session(&session.id).await;
+        state.chat.acp.stop(&session.id).await;
     }
     store.delete_local_project(&id)?;
     for session in &sessions {
@@ -2285,22 +2322,20 @@ pub(crate) async fn submit_run_via_up(
     })
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct HarnessInstall {
-    pub name: String,
-    pub installed: bool,
-}
-
-/// `orx up`'s install evidence for `harness`, from its own PATH rather than the caller's.
-pub(crate) async fn harness_install_via_up(port: u16, harness: &str) -> Result<HarnessInstall> {
-    let response = authenticate_up_request(local_client()?.get(format!(
-        "http://127.0.0.1:{port}/api/harnesses/{harness}/snapshot"
-    )))
-    .timeout(Duration::from_secs(10))
+pub(crate) async fn chat_request_via_up(
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+    body: &Value,
+) -> Result<Value> {
+    let response = authenticate_up_request(
+        local_client()?.request(method, format!("http://127.0.0.1:{port}{path}")),
+    )
+    .json(body)
     .send()
     .await
-    .map_err(|error| anyhow!("Could not reach the trusted orx up process: {error}"))?;
-    decode_local_response(response, "check the harness").await
+    .map_err(|error| anyhow!("Could not reach the trusted OpenResearch server: {error}"))?;
+    decode_local_response(response, "submit the chat request").await
 }
 
 pub(crate) async fn cancel_run_via_up(port: u16, run_id: &str) -> Result<()> {
@@ -4742,9 +4777,11 @@ fn env_settings_json() -> Value {
     let vars: Vec<Value> = crate::config::list_synced_env()
         .iter()
         .map(|(key, value)| {
+            let plain = crate::local::trackio::plain_value(key, value);
             json!({
                 "key": key,
-                "maskedValue": mask_token(value),
+                "maskedValue": mask_token(plain.as_deref().unwrap_or(value)),
+                "value": plain,
                 "inProcessEnv": std::env::var_os(key).is_some(),
             })
         })
@@ -5385,6 +5422,7 @@ async fn set_dashboard_locale(Json(SetLocaleReq { locale }): Json<SetLocaleReq>)
     tokio::task::spawn_blocking(move || {
         crate::telemetry::set_dashboard_locale(&locale)
             .map_err(|e| ApiError::from(anyhow!("could not save the dashboard locale: {e}")))?;
+        crate::telemetry::capture("dashboard_locale", json!({}));
         Ok(Json(json!({ "locale": locale })))
     })
     .await
@@ -6318,7 +6356,7 @@ async fn openresearch_terminal(
     let program = crate::paths::spawnable_exe()
         .map(|exe| exe.to_string_lossy().into_owned())
         .map_err(anyhow::Error::from);
-    command_terminal(&headers, ws, program, args, false).await
+    command_terminal(&headers, ws, program, args, Vec::new(), false).await
 }
 
 /// Commands the settings page may run, keyed by the exact note text. The
@@ -6328,6 +6366,16 @@ const SETTINGS_COMMANDS: &[(&str, &[&str])] = &[
     ("gh auth login", &["gh", "auth", "login"]),
     ("hf auth login", &["hf", "auth", "login"]),
     ("claude auth status", &["claude", "auth", "status"]),
+    ("kimi login", &["kimi", "login"]),
+    (
+        "mcode login --region global",
+        &["mcode", "login", "--region", "global"],
+    ),
+    ("devin auth login", &["devin", "auth", "login"]),
+    ("grok login", &["grok", "login"]),
+    ("pi", &["pi"]),
+    ("zcode login zai", &["zcode", "login", "zai"]),
+    ("zcode login bigmodel", &["zcode", "login", "bigmodel"]),
 ];
 
 fn settings_command(command: &str) -> Option<&'static [&'static str]> {
@@ -6354,11 +6402,75 @@ async fn run_settings_command(
     let Some(argv) = settings_command(req.command.trim()) else {
         return bad_request("command is not runnable from settings").into_response();
     };
-    let program = local::shell_env::find_on_path(argv[0])
-        .map(|path| path.to_string_lossy().into_owned())
-        .ok_or_else(|| anyhow!("{} is not installed", argv[0]));
-    let args = argv[1..].iter().map(|arg| arg.to_string()).collect();
-    command_terminal(&headers, ws, program, args, true).await
+    let mut args: Vec<String> = argv[1..].iter().map(|arg| arg.to_string()).collect();
+    let mut env = Vec::new();
+    let program = if argv[0] == "zcode" && local::acp::executable_path("zcode").is_none() {
+        let mut candidates = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join("Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"));
+        }
+        candidates.push(std::path::PathBuf::from(
+            "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+        ));
+        if let Some(data) = dirs::data_local_dir() {
+            candidates.push(data.join("Programs/ZCode/resources/glm/zcode.cjs"));
+        }
+        match (
+            local::acp::executable_path("node"),
+            candidates.into_iter().find(|path| path.is_file()),
+        ) {
+            (Some(node), Some(cli)) => {
+                let home = local::shell_env::var("ZCODE_HOME")
+                    .or_else(|| {
+                        crate::config::synced_env_var("ZCODE_HOME").map(std::ffi::OsString::from)
+                    })
+                    .filter(|home| !home.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".zcode"));
+                env = zcode_provider_env(&cli, &home);
+                env.push(("ZCODE_HOME", home.into_os_string()));
+                args.insert(0, cli.to_string_lossy().into_owned());
+                Ok(node.to_string_lossy().into_owned())
+            }
+            _ => Err(anyhow!(
+                "ZCode CLI not found. Install ZCode and Node.js, then retry."
+            )),
+        }
+    } else {
+        local::acp::executable_path(argv[0])
+            .map(|path| path.to_string_lossy().into_owned())
+            .ok_or_else(|| anyhow!("{} is not installed", argv[0]))
+    };
+    command_terminal(&headers, ws, program, args, env, true).await
+}
+
+fn zcode_provider_env(
+    cli: &std::path::Path,
+    home: &std::path::Path,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    let Some(directory) = cli.parent() else {
+        return Vec::new();
+    };
+    let provider = [
+        directory.join("provider/zcode-builtin.json"),
+        directory.join("../config/provider/zcode-builtin.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    let Some(provider) = provider else {
+        return Vec::new();
+    };
+    // ZCode uses the bundled table verbatim only when both paths are explicit.
+    vec![
+        (
+            "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+            provider.into_os_string(),
+        ),
+        (
+            "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+            home.join("v2/provider_config.json").into_os_string(),
+        ),
+    ]
 }
 
 /// The user's interactive login shell, so follow-up commands see the PATH a
@@ -6386,6 +6498,7 @@ async fn command_terminal(
     ws: WebSocketUpgrade,
     program: Result<String>,
     args: Vec<String>,
+    env: Vec<(&'static str, std::ffi::OsString)>,
     shell_after: bool,
 ) -> Response {
     if let Some(rejected) = reject_cross_origin(headers) {
@@ -6396,7 +6509,7 @@ async fn command_terminal(
         let _active = active;
         let mut size = DEFAULT_PTY_SIZE;
         let started = match program {
-            Ok(program) => spawn_pty(program, args, Vec::new(), size).await,
+            Ok(program) => spawn_pty(program, args, env, size).await,
             Err(error) => Err(error),
         };
         let session = match started {
@@ -6514,7 +6627,7 @@ async fn create_remote_session(
     if host.is_empty() {
         return Err(bad_request("host is required"));
     }
-    require_configured_ssh_host(&host)?;
+    require_configured_ssh_host(&host).await?;
     let (created, session) = state
         .remote_sessions
         .create(host, req.ui_preferences, None)
@@ -6610,6 +6723,8 @@ const FILL_RETRY_FLOOR: Duration = Duration::from_secs(5);
 struct HarnessQuery {
     refresh: Option<u8>,
     retry: Option<u8>,
+    /// With `refresh=1`, re-detect only this harness instead of every one.
+    harness: Option<String>,
 }
 
 fn overlay_claude_auth(payload: &mut Value, snapshot: &local::claude::AuthSnapshot) {
@@ -6872,6 +6987,70 @@ async fn list_harnesses(
     Json(harnesses_payload(&state, &q).await)
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcpHarnessInput {
+    name: String,
+    executable: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+}
+
+impl AcpHarnessInput {
+    fn definition(self, id: String) -> local::acp::Definition {
+        local::acp::Definition {
+            id,
+            name: self.name,
+            executable: self.executable,
+            arguments: self.arguments,
+        }
+    }
+}
+
+async fn list_acp_harnesses() -> Json<Value> {
+    Json(json!(local::acp::definitions()))
+}
+
+async fn list_acp_presets() -> Json<Value> {
+    Json(json!(local::acp::presets()))
+}
+
+async fn create_acp_harness(
+    State(state): State<AppState>,
+    Json(input): Json<AcpHarnessInput>,
+) -> ApiResult {
+    let definition = input.definition(format!("acp:{}", uuid::Uuid::new_v4()));
+    local::acp::save(definition.clone(), true).map_err(bad_request)?;
+    *state.harnesses.lock().await = None;
+    Ok(Json(json!(definition)))
+}
+
+async fn update_acp_harness(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<AcpHarnessInput>,
+) -> ApiResult {
+    let definition = input.definition(id);
+    local::acp::save(definition.clone(), false).map_err(bad_request)?;
+    *state.harnesses.lock().await = None;
+    Ok(Json(json!(definition)))
+}
+
+async fn delete_acp_harness(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    local::acp::remove(&id).map_err(bad_request)?;
+    *state.harnesses.lock().await = None;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn test_acp_harness(Json(input): Json<AcpHarnessInput>) -> ApiResult {
+    let definition = input.definition(format!("acp:{}", uuid::Uuid::new_v4()));
+    Ok(Json(
+        local::acp::test_connection(&definition)
+            .await
+            .map_err(bad_request)?,
+    ))
+}
+
 /// The shared detection path behind `GET /api/harnesses` and the startup
 /// preflight: the snapshot pass runs under the cache lock, so whoever arrives
 /// first does the probing and everyone else in the TTL window reads the same
@@ -6883,11 +7062,24 @@ async fn list_harnesses(
 /// a background fill replaces the entry with the full catalog, then tells the
 /// dashboard to re-read it. `refresh=1` still runs the full probe inline: an
 /// explicit re-check wants the real answer, and the UI shows its own spinner.
+/// With `harness=<id>` it probes only that harness (unless a fill is running)
+/// and serves the cache with it patched in.
 async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
     // `retry` only escalates to a full detect when it actually cleared a
     // runtime rejection — a bare retry is an ordinary cached read.
     let retried = q.retry == Some(1) && state.claude.clear_runtime_rejection();
-    if q.refresh == Some(1) || retried {
+    if let (Some(1), Some(id)) = (q.refresh, q.harness.as_deref()) {
+        // Publishing re-stamps the cache, voiding an in-flight fill's other harnesses;
+        // the fill commits this one itself and the auth monitor re-checks after it.
+        if !state
+            .harness_fill_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Some(info) = local::harness::detect_harness(id).await {
+                publish_harness(state, &info).await;
+            }
+        }
+    } else if q.refresh == Some(1) || retried {
         // An explicit re-check detects outside the cache lock: a full sweep
         // takes seconds and must not stall every ordinary read queued behind
         // it. Last writer wins — concurrent refreshes may duplicate a sweep.
@@ -6931,8 +7123,8 @@ async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
     seed_harnesses_locked(state, &mut cache).await
 }
 
-/// Commit one harness's full detection after setup changed it, so the
-/// dashboard need not wait on every sibling's probes to see the result.
+/// Commit one harness's full detection after setup or a sign-in changed it, so
+/// the dashboard need not wait on every sibling's probes to see the result.
 async fn publish_harness(state: &AppState, info: &local::harness::HarnessInfo) {
     if info.id == "claude-code" {
         if let Some(probe) = info.auth_observation.as_ref() {
@@ -6950,10 +7142,10 @@ async fn publish_harness(state: &AppState, info: &local::harness::HarnessInfo) {
     let Some((at, payload)) = cache.as_mut() else {
         return;
     };
-    let Some(slot) = payload["harnesses"]
-        .as_array_mut()
-        .and_then(|all| all.iter_mut().find(|h| h["id"].as_str() == Some(info.id)))
-    else {
+    let Some(slot) = payload["harnesses"].as_array_mut().and_then(|all| {
+        all.iter_mut()
+            .find(|h| h["id"].as_str() == Some(info.id.as_str()))
+    }) else {
         return;
     };
     *slot = json!(info);
@@ -7023,7 +7215,7 @@ async fn seed_harnesses_locked(
 /// live Claude auth observations and first-install telemetry.
 /// The returned `Option` is a claimed auth announcement: the caller emits it
 /// only after committing the payload, so a discarded pass never sends the
-/// dashboard on a `refresh=1` sweep for results nobody will see.
+/// dashboard to re-probe Claude for results nobody will see.
 async fn finish_harnesses_payload(
     state: &AppState,
     harnesses: Vec<local::harness::HarnessInfo>,
@@ -7049,8 +7241,8 @@ async fn finish_harnesses_payload(
         snapshot = state.claude.auth_snapshot();
     }
     // A provisional pass must not announce: `harness.auth` makes the dashboard
-    // call `refreshHarnesses(true)`, an inline full sweep — the stall this
-    // whole design exists to remove — fired by the snapshot's own adoption.
+    // re-probe Claude inline — the stall this whole design exists to remove —
+    // fired by the snapshot's own adoption.
     // A real pass hands its auth snapshot back unclaimed; the caller claims at
     // emit time, after the payload commits, so a pass that loses the cache
     // race never burns a generation it can't announce.
@@ -7187,7 +7379,8 @@ fn spawn_catalog_fill(state: AppState, snapshot_at: std::time::Instant, fill_id:
                         if *at == snapshot_at {
                             if let Some(slot) =
                                 payload["harnesses"].as_array_mut().and_then(|all| {
-                                    all.iter_mut().find(|h| h["id"].as_str() == Some(info.id))
+                                    all.iter_mut()
+                                        .find(|h| h["id"].as_str() == Some(info.id.as_str()))
                                 })
                             {
                                 *slot = json!(info);
@@ -7320,6 +7513,12 @@ struct SessionsQuery {
     before_id: Option<String>,
 }
 
+fn sidebar_session_json(store: &Store, session: &StoredChatSession, busy: bool) -> Result<Value> {
+    let mut value = local::chat::session_json(session, busy);
+    value["awaitingInput"] = json!(store.chat_session_awaiting_input(&session.id, busy)?);
+    Ok(value)
+}
+
 async fn list_chat_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionsQuery>,
@@ -7341,8 +7540,8 @@ async fn list_chat_sessions(
         let busy = state.chat.busy_sessions().await;
         let sessions: Vec<Value> = sessions
             .iter()
-            .map(|session| local::chat::session_json(session, busy.contains(&session.id)))
-            .collect();
+            .map(|session| sidebar_session_json(&store, session, busy.contains(&session.id)))
+            .collect::<Result<_>>()?;
         return Ok(Json(json!({ "sessions": sessions, "next": next })));
     }
     let sessions = match (q.project_id.as_deref(), q.scope.as_deref()) {
@@ -7353,8 +7552,8 @@ async fn list_chat_sessions(
     let busy = state.chat.busy_sessions().await;
     let sessions: Vec<Value> = sessions
         .iter()
-        .map(|s| local::chat::session_json(s, busy.contains(&s.id)))
-        .collect();
+        .map(|s| sidebar_session_json(&store, s, busy.contains(&s.id)))
+        .collect::<Result<_>>()?;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
@@ -7362,7 +7561,7 @@ async fn list_chat_sessions(
 #[serde(rename_all = "camelCase")]
 struct CreateChatSessionReq {
     project_id: String,
-    harness: String,
+    harness: Option<String>,
     model: Option<String>,
     service_tier: Option<String>,
     permission_mode: Option<String>,
@@ -7372,14 +7571,117 @@ struct CreateChatSessionReq {
     autonomy: Option<Autonomy>,
 }
 
+fn new_chat_settings(
+    project_id: String,
+    preferences: crate::store::StoredUiState,
+    catalog: &Value,
+) -> Result<CreateChatSessionReq> {
+    let harnesses = catalog
+        .get("harnesses")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("OpenResearch could not load New Chat settings."))?;
+    let saved = preferences.preferred_agent;
+    let selected = match saved.as_ref() {
+        Some(saved) => harnesses
+            .iter()
+            .find(|h| h.get("id").and_then(Value::as_str) == Some(&saved.harness)),
+        None => harnesses
+            .iter()
+            .find(|h| h.get("agentReady").and_then(Value::as_bool) == Some(true)),
+    }
+    .ok_or_else(|| {
+        anyhow!("Your New Chat agent is unavailable. Select an available agent in New Chat.")
+    })?;
+    if selected.get("agentReady").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!("Your New Chat agent is unavailable. Check its installation and sign-in in OpenResearch."));
+    }
+    let string = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_string);
+    let harness = string(selected.get("id"));
+    let models = selected.get("models").and_then(Value::as_array);
+    let model = saved.as_ref().and_then(|s| s.model.clone()).or_else(|| {
+        if saved.is_none() {
+            string(models.and_then(|m| m.first()).and_then(|m| m.get("id")))
+        } else {
+            None
+        }
+    });
+    let metadata = models.and_then(|models| {
+        models
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == model.as_deref())
+    });
+    let options = selected.get("options");
+    let choices = metadata
+        .and_then(|m| m.get("reasoningLevels"))
+        .or_else(|| options.and_then(|o| o.get("reasoningLevels")))
+        .and_then(Value::as_array);
+    let has = |choices: Option<&Vec<Value>>, id: &str| {
+        choices.is_some_and(|choices| {
+            choices
+                .iter()
+                .any(|c| c.get("id").and_then(Value::as_str) == Some(id))
+        })
+    };
+    let model_default = string(metadata.and_then(|m| m.get("defaultReasoningLevel")));
+    let default_reasoning = model_default
+        .filter(|id| has(choices, id))
+        .or_else(|| has(choices, "default").then(|| "default".to_string()))
+        .or_else(|| string(options.and_then(|o| o.get("defaultReasoningLevel"))))
+        .or_else(|| string(choices.and_then(|c| c.first()).and_then(|c| c.get("id"))));
+    let reasoning_level = if choices.is_none_or(Vec::is_empty) {
+        Some("default".to_string())
+    } else {
+        saved
+            .as_ref()
+            .and_then(|s| s.reasoning_level.clone())
+            .filter(|id| has(choices, id))
+            .or(default_reasoning)
+    };
+    let tiers = metadata
+        .and_then(|m| m.get("serviceTiers"))
+        .and_then(Value::as_array);
+    let service_tier = if harness.as_deref() == Some("codex") && tiers.is_some() {
+        Some(
+            saved
+                .as_ref()
+                .and_then(|s| s.service_tier.clone())
+                .filter(|id| id == "default" || has(tiers, id))
+                .unwrap_or_else(|| "default".to_string()),
+        )
+    } else {
+        None
+    };
+    let permission_mode = match saved.as_ref() {
+        Some(saved) => saved.permission_mode.clone(),
+        None => string(options.and_then(|o| o.get("defaultPermissionMode"))),
+    };
+    Ok(CreateChatSessionReq {
+        project_id,
+        harness,
+        model,
+        service_tier,
+        permission_mode,
+        plan_mode: false,
+        reasoning_level,
+        autonomy: Some(preferences.preferred_autonomy.unwrap_or(Autonomy::Agentic)),
+    })
+}
+
+async fn get_chat_session(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
+    let session = Store::open()?
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    let busy = state.chat.is_busy(&id).await;
+    Ok(Json(
+        json!({ "session": local::chat::session_json(&session, busy) }),
+    ))
+}
+
 async fn create_chat_session(
     State(state): State<AppState>,
-    Json(req): Json<CreateChatSessionReq>,
+    Json(mut req): Json<CreateChatSessionReq>,
 ) -> ApiResult {
     reject_if_moving(&state)?;
-    if !local::harness::is_chat_harness(&req.harness) {
-        return Err(bad_request(format!("unknown harness: {}", req.harness)));
-    }
     let _admission = state
         .project_lifecycle
         .admit(&req.project_id)
@@ -7388,22 +7690,41 @@ async fn create_chat_session(
     store
         .get_local_project(&req.project_id)?
         .ok_or_else(|| not_found("project"))?;
+    if req.harness.is_none() {
+        let preferences = store.ui_state()?;
+        let catalog = harnesses_payload(
+            &state,
+            &HarnessQuery {
+                refresh: None,
+                retry: None,
+                harness: None,
+            },
+        )
+        .await;
+        req = new_chat_settings(req.project_id, preferences, &catalog).map_err(bad_request)?;
+    }
+    let harness = req
+        .harness
+        .ok_or_else(|| bad_request("no agent selected"))?;
+    if !local::harness::is_chat_harness(&harness) {
+        return Err(bad_request(format!("unknown harness: {harness}")));
+    }
     let nonempty = |s: Option<String>| s.filter(|v| !v.trim().is_empty());
     let permission_mode = nonempty(req.permission_mode);
     let service_tier = nonempty(req.service_tier);
     if permission_mode
         .as_deref()
-        .is_some_and(|mode| local::harness::permission_mode_for(&req.harness, mode).is_none())
+        .is_some_and(|mode| local::harness::permission_mode_for(&harness, mode).is_none())
     {
         return Err(bad_request("invalid permission mode for selected harness"));
     }
     if service_tier
         .as_deref()
-        .is_some_and(|tier| local::harness::service_tier_for(&req.harness, tier).is_none())
+        .is_some_and(|tier| local::harness::service_tier_for(&harness, tier).is_none())
     {
         return Err(bad_request("invalid speed for selected harness"));
     }
-    if req.plan_mode && !local::harness::supports_command_plan(&req.harness) {
+    if req.plan_mode && !local::harness::supports_command_plan(&harness) {
         return Err(bad_request(
             "this harness activates Plan through permissions",
         ));
@@ -7411,7 +7732,7 @@ async fn create_chat_session(
     let session = StoredChatSession {
         id: format!("chat_{}", uuid::Uuid::new_v4()),
         project_id: req.project_id,
-        harness: req.harness,
+        harness,
         native_session_id: None,
         title: None,
         title_source: None,
@@ -7427,12 +7748,13 @@ async fn create_chat_session(
         goal: None,
         autonomy: req.autonomy.map(|autonomy| autonomy.id().to_string()),
         active_leaf_id: None,
-        parent_session_id: None,
         side_parent_session_id: None,
+        side_parent_leaf_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
     store.create_chat_session(&session)?;
+    state.chat.emit_session(Some(session.clone())).await;
     Ok(Json(
         json!({ "session": local::chat::session_json(&session, false) }),
     ))
@@ -7546,6 +7868,88 @@ struct UpdateChatSessionReq {
     #[serde(default, deserialize_with = "present_nullable_string")]
     goal: Option<Option<String>>,
     autonomy: Option<Autonomy>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeConfigurationInput {
+    option_id: String,
+    value: String,
+}
+
+async fn set_chat_configuration(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<NativeConfigurationInput>,
+) -> ApiResult {
+    reject_if_moving(&state)?;
+    let store = Store::open()?;
+    let session = store
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    let saved = store
+        .acp_session_state(&id)?
+        .ok_or_else(|| bad_request("This chat is not an ACP session"))?;
+    let _reservation;
+    let client = match state.chat.acp.connected(&id).await {
+        Ok(client) => {
+            _reservation = None;
+            client
+        }
+        Err(_) => {
+            _reservation = Some(
+                local::chat::TurnGuard::claim(&state.chat, &id, None)
+                    .await
+                    .ok_or_else(|| {
+                        bad_request(
+                            "Chat is busy; try changing the option again after the turn finishes",
+                        )
+                    })?,
+            );
+            let native_id = session.native_session_id.as_deref().ok_or_else(|| {
+                bad_request("Start the conversation before changing agent options")
+            })?;
+            let project = store
+                .get_local_project(&session.project_id)?
+                .ok_or_else(|| not_found("project"))?;
+            let session_id = id.clone();
+            let (cwd, _) = tokio::task::spawn_blocking(move || {
+                local::opencode::ensure_playbook(&project, &session_id, None)
+            })
+            .await
+            .map_err(bad_request)?
+            .map_err(bad_request)?;
+            let client = state
+                .chat
+                .acp
+                .get(&id, &saved.launch, &cwd)
+                .await
+                .map_err(bad_request)?;
+            match client.restore(native_id, &cwd).await {
+                Ok(configuration) => store.set_acp_configuration(&id, &configuration)?,
+                Err(error) => {
+                    state.chat.acp.stop(&id).await;
+                    return Err(bad_request(error));
+                }
+            }
+            client.end_turn();
+            client
+        }
+    };
+    client
+        .configure(&id, &input.option_id, &input.value)
+        .await
+        .map_err(bad_request)?;
+    let session = Store::open()?.get_chat_session(&id)?;
+    let session = state
+        .chat
+        .emit_session(session)
+        .await
+        .ok_or_else(|| bad_request("Chat session no longer exists"))?;
+    Ok(Json(local::chat::session_json(
+        &session,
+        state.chat.is_busy(&id).await,
+    )))
 }
 
 async fn update_chat_session(
@@ -8402,6 +8806,73 @@ pub(crate) async fn spa(uri: Uri) -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn new_chat_uses_saved_preferences_and_normalizes_model_settings() {
+        let preferences = crate::store::StoredUiState {
+            onboarding_completed: true,
+            tour_completed: true,
+            workspace: None,
+            preferred_autonomy: Some(Autonomy::Copilot),
+            preferred_agent: Some(StoredAgentSelection {
+                harness: "codex".into(),
+                model: Some("custom-model".into()),
+                reasoning_level: Some("ultra".into()),
+                permission_mode: Some("full-access".into()),
+                service_tier: Some("priority".into()),
+            }),
+        };
+        let catalog = json!({"harnesses": [{
+            "id": "codex", "agentReady": true,
+            "models": [], "options": {"reasoningLevels": [{"id": "default"}, {"id": "high"}]}
+        }]});
+        let req = new_chat_settings("project".into(), preferences, &catalog).unwrap();
+        assert_eq!(req.harness.as_deref(), Some("codex"));
+        assert_eq!(req.model.as_deref(), Some("custom-model"));
+        assert_eq!(req.reasoning_level.as_deref(), Some("default"));
+        assert!(req.service_tier.is_none());
+        assert_eq!(req.permission_mode.as_deref(), Some("full-access"));
+        assert_eq!(req.autonomy, Some(Autonomy::Copilot));
+        assert!(!req.plan_mode);
+    }
+
+    #[test]
+    fn new_chat_falls_back_only_when_no_preference_exists() {
+        let mut preferences = crate::store::StoredUiState {
+            onboarding_completed: false,
+            tour_completed: false,
+            workspace: None,
+            preferred_autonomy: None,
+            preferred_agent: None,
+        };
+        let catalog = json!({"harnesses": [{"id":"claude-code", "agentReady":true,
+            "models":[{"id":"opus"}], "options":{"defaultPermissionMode":"plan", "reasoningLevels":[{"id":"default"}]}}]});
+        let req = new_chat_settings("project".into(), preferences.clone(), &catalog).unwrap();
+        assert_eq!(req.harness.as_deref(), Some("claude-code"));
+        assert_eq!(req.model.as_deref(), Some("opus"));
+        assert_eq!(req.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(req.autonomy, Some(Autonomy::Agentic));
+        preferences.preferred_agent = Some(StoredAgentSelection {
+            harness: "claude-code".into(),
+            model: Some("custom-claude-model".into()),
+            service_tier: None,
+            permission_mode: Some("plan".into()),
+            reasoning_level: Some("default".into()),
+        });
+        let req = new_chat_settings("project".into(), preferences.clone(), &catalog).unwrap();
+        assert_eq!(req.harness.as_deref(), Some("claude-code"));
+        assert_eq!(req.model.as_deref(), Some("custom-claude-model"));
+        let unavailable = json!({"harnesses": [{"id":"claude-code", "agentReady":false}, {"id":"codex", "agentReady":true}]});
+        assert!(new_chat_settings("project".into(), preferences.clone(), &unavailable).is_err());
+        preferences.preferred_agent = Some(StoredAgentSelection {
+            harness: "codex".into(),
+            model: Some("gpt-6-sol".into()),
+            service_tier: None,
+            permission_mode: None,
+            reasoning_level: None,
+        });
+        assert!(new_chat_settings("project".into(), preferences, &catalog).is_err());
+    }
+
     #[tokio::test]
     async fn empty_local_error_reports_the_http_status() {
         for (status, body, expected) in [
@@ -8784,6 +9255,32 @@ mod tests {
     }
 
     #[test]
+    fn bundled_zcode_login_has_both_provider_paths() {
+        let root = std::env::temp_dir().join(format!("orx-zcode-login-{}", uuid::Uuid::new_v4()));
+        let cli = root.join("Resources/glm/zcode.cjs");
+        let provider = root.join("Resources/config/provider/zcode-builtin.json");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(provider.parent().unwrap()).unwrap();
+        std::fs::write(&provider, "{}").unwrap();
+        let home = root.join("test-home");
+        let env = zcode_provider_env(&cli, &home);
+        assert_eq!(env.len(), 2);
+        assert_eq!(
+            std::fs::canonicalize(&env[0].1).unwrap(),
+            std::fs::canonicalize(provider).unwrap()
+        );
+        assert_eq!(
+            env[1],
+            (
+                "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+                home.join("v2/provider_config.json").into_os_string()
+            )
+        );
+        assert!(zcode_provider_env(&root.join("missing/zcode.cjs"), &home).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn settings_commands_are_an_exact_allowlist() {
         assert_eq!(
             settings_command("gh auth login"),
@@ -8791,6 +9288,11 @@ mod tests {
         );
         assert_eq!(settings_command("gh auth login; rm -rf ~"), None);
         assert_eq!(settings_command("gh"), None);
+        assert_eq!(
+            settings_command("zcode login zai"),
+            Some(&["zcode", "login", "zai"][..])
+        );
+        assert_eq!(settings_command("zcode login zai; echo token"), None);
     }
 
     #[tokio::test]

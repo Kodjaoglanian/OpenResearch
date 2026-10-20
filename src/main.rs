@@ -76,7 +76,7 @@ enum Command {
     /// Operate on one local project.
     Project(ProjectArgs),
 
-    /// Delegate a task to a second agent session.
+    /// Create independent project chats.
     Agent(AgentArgs),
 
     /// List a project's runs.
@@ -84,6 +84,9 @@ enum Command {
 
     /// Show a run's compact log summary (path, size, and preview) by default.
     Logs(LogsArgs),
+
+    /// Print the command that opens a run's TensorBoard logs.
+    Tensorboard(TensorboardArgs),
 
     /// Add an experiment node to a local `orx up` project.
     #[command(name = "create-experiment")]
@@ -253,6 +256,11 @@ pub struct LogsArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct TensorboardArgs {
+    pub run_id: String,
+}
+
+#[derive(Args, Debug)]
 pub struct CreateExperimentArgs {
     /// Local project id from `orx projects`.
     pub project_id: String,
@@ -374,10 +382,12 @@ pub struct AgentArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum AgentCommand {
-    /// Hand a task to a helper agent running in its own top-level session.
+    /// Create an independent chat using your saved New Chat settings.
+    #[command(
+        after_help = "New chats use your saved New Chat settings. --harness, --model, and --no-wake are no longer supported; created chats never wake the creator."
+    )]
     Spawn {
-        /// What the helper agent should do. Write it as a self-contained brief:
-        /// the helper starts with an empty transcript and cannot see this chat.
+        /// Opening message for the new chat; it starts with an empty transcript.
         task: Option<String>,
         /// Read the task from stdin instead, for long multi-paragraph briefs.
         #[arg(long)]
@@ -385,15 +395,9 @@ pub enum AgentCommand {
         /// Name the session in the sidebar. Defaults to an auto-generated title.
         #[arg(long)]
         title: Option<String>,
-        /// Harness for the helper (defaults to this session's).
+        /// Project ID (defaults to the current OpenResearch chat's project).
         #[arg(long)]
-        harness: Option<String>,
-        /// Model for the helper (defaults to this session's).
-        #[arg(long)]
-        model: Option<String>,
-        /// Do not resume this chat when the helper finishes.
-        #[arg(long)]
-        no_wake: bool,
+        project: Option<String>,
     },
 }
 
@@ -434,6 +438,18 @@ pub enum ExpCommand {
         /// Restore descendants, excluding the selected experiment.
         #[arg(long, group = "unarchive_scope")]
         descendants: bool,
+    },
+
+    /// Re-parent an experiment and its subtree. Only the tree changes; git branches stay put.
+    #[command(group(clap::ArgGroup::new("move_target").required(true)))]
+    Move {
+        exp_id: String,
+        /// New parent experiment in the same project.
+        #[arg(long, group = "move_target")]
+        parent: Option<String>,
+        /// Make the experiment a new root (baseline).
+        #[arg(long, group = "move_target")]
+        baseline: bool,
     },
 
     /// Show the experiment's status, run command, and latest run.
@@ -945,6 +961,19 @@ pub struct PaperArgs {
     pub full: bool,
 }
 
+fn explain_removed_spawn_flags(mut error: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if error.kind() == ErrorKind::UnknownArgument
+        && error.to_string().contains(" agent spawn")
+        && matches!(error.get(ContextKind::InvalidArg), Some(ContextValue::String(flag)) if ["--harness", "--model", "--no-wake"].contains(&flag.split('=').next().unwrap_or(flag)))
+    {
+        error.insert(ContextKind::Suggested, ContextValue::StyledStrs(vec![
+            "New chats use your saved New Chat settings and never wake the creator. Configure the agent and model in OpenResearch.".into()
+        ]));
+    }
+    error
+}
+
 // The default multi-thread runtime is load-bearing for desktop app mode: it
 // blocks the main thread in the window's run loop while the dashboard server runs
 // on worker threads. A `current_thread` flavor would deadlock. See commands::app.
@@ -976,7 +1005,7 @@ async fn main() {
         return;
     }
 
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|error| explain_removed_spawn_flags(error).exit());
     // Double-clicked from Explorer: open the desktop app instead of a console session.
     #[cfg(windows)]
     if cli.command.is_none() && owns_its_console() {
@@ -1230,6 +1259,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Agent(_) => "agent",
         Command::Runs(_) => "runs",
         Command::Logs(_) => "logs",
+        Command::Tensorboard(_) => "tensorboard",
         Command::CreateExperiment(_) => "create-experiment",
         Command::Compute(_) => "compute",
         Command::Instance(_) => "instance",
@@ -1279,6 +1309,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::Agent(args) => commands::agent::run(args).await,
         Command::Runs(args) => commands::runs::run(args).await,
         Command::Logs(args) => commands::logs::run(args).await,
+        Command::Tensorboard(args) => commands::tensorboard::run(args).await,
         Command::CreateExperiment(args) => commands::create_experiment::run(args).await,
         Command::Compute(args) => commands::compute::run(args).await,
         Command::Instance(args) => commands::instance::run(args).await,
@@ -1424,6 +1455,21 @@ mod cli_tests {
             };
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn agent_spawn_rejects_removed_settings_flags() {
+        for program in ["orx", "orx.exe"] {
+            for flag in ["--harness", "--model", "--model=legacy", "--no-wake"] {
+                let error = Cli::try_parse_from([program, "agent", "spawn", "task", flag])
+                    .expect_err("removed flag");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+                assert!(explain_removed_spawn_flags(error)
+                    .to_string()
+                    .contains("saved New Chat settings"));
+            }
+        }
+        assert!(Cli::try_parse_from(["orx", "agent", "spawn", "task", "--project", "p1"]).is_ok());
     }
 
     #[test]

@@ -1,5 +1,13 @@
 import type { ChatMessage, ChatPart, ChatSession } from "./api";
 
+export function hasPendingInput(messages: ChatMessage[], busy: boolean): boolean {
+  return messages.some((message) => message.parts.some((part) => {
+    const prompt = part.prompt;
+    return part.type === "prompt" && prompt && !prompt.resolved
+      && (prompt.nativeId ? busy : prompt.kind === "question");
+  }));
+}
+
 export function pendingQuestionId(
   messages: ChatMessage[],
   harness: ChatSession["harness"] | undefined,
@@ -41,7 +49,7 @@ export function isTurnStatusPart(part: ChatPart): boolean {
 
 export function withoutDuplicateTurnError(parts: ChatPart[], turnStatus: ChatPart | undefined): ChatPart[] {
   const last = parts.at(-1);
-  return turnStatus?.id === "turn-recovery" && last?.type === "tool" && last.tool === "error"
+  return turnStatus?.id === "turn-recovery" && last?.type === "tool" && (last.tool === "error" || last.tool === "api_error")
     && last.state?.error && last.state.error === turnStatus.state?.error ? parts.slice(0, -1) : parts;
 }
 
@@ -157,7 +165,7 @@ export function transcriptFileName(title: string): string {
 
 export function isModelAccessLimitPart(part: ChatPart): boolean {
   return part.type === "tool" && part.tool === "error"
-    && /^(?:ActionRequiredError:\s*)?Named models unavailable\b/i.test(part.state?.error?.trim() ?? "");
+    && /^(?:(?:ActionRequiredError:\s*)?Named models unavailable\b|ZCode turn failed:\s*1113\b)/i.test(part.state?.error?.trim() ?? "");
 }
 
 export function isUsageLimitPart(part: ChatPart): boolean {
