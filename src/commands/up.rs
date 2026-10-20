@@ -960,7 +960,7 @@ impl From<&StoredRun> for ApiRun {
             experiment_id: run.experiment_id.clone(),
             project_id: run.project_id.clone(),
             status: run.status.clone(),
-            backend: serde_json::from_str(&run.backend_json).ok(),
+            backend: crate::store::public_backend(&run.backend_json),
             command: Some(run.command.clone()).filter(|c| !c.is_empty()),
             commit_sha: run.commit_sha.clone(),
             result_markdown: run.result_markdown.clone(),
@@ -9317,7 +9317,8 @@ mod tests {
             experiment_id: "experiment-1".into(),
             project_id: "project-1".into(),
             status: "running".into(),
-            backend_json: "{}".into(),
+            backend_json: r#"{"kind":"openresearch","rental":{"token":"private-rental-token"}}"#
+                .into(),
             command: String::new(),
             created_at: 1,
             updated_at: 2,
@@ -9332,6 +9333,11 @@ mod tests {
 
         let value = serde_json::to_value(ApiRun::from(&run)).unwrap();
         assert_eq!(value["cancelRequested"], true);
+        assert_eq!(value["backend"]["kind"], "openresearch");
+        assert!(!value.to_string().contains("private-rental-token"));
+        let legacy = serde_json::to_value(&run).unwrap();
+        assert!(!legacy.to_string().contains("private-rental-token"));
+        assert!(run.backend_json.contains("private-rental-token"));
     }
 
     #[test]

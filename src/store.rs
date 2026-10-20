@@ -233,6 +233,7 @@ pub struct StoredRun {
     pub experiment_id: String,
     pub project_id: String,
     pub status: String,
+    #[serde(serialize_with = "serialize_public_backend")]
     pub backend_json: String,
     pub command: String,
     /// Unix millis.
@@ -251,6 +252,25 @@ pub struct StoredRun {
     /// CLI-launched runs. This records attribution; wake-ups are
     /// separately and explicitly registered in `chat_run_wakeups`.
     pub chat_session_id: Option<String>,
+}
+
+pub fn public_backend(value: &str) -> Option<serde_json::Value> {
+    let mut backend = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    if let Some(fields) = backend.as_object_mut() {
+        fields.remove("rental");
+    }
+    Some(backend)
+}
+
+fn serialize_public_backend<S: serde::Serializer>(
+    value: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(
+        &public_backend(value)
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    )
 }
 
 /// Run lifecycle: active states can finish once; terminal outcomes never change.
