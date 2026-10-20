@@ -761,6 +761,7 @@ mod hard_link_tests {
     }
 
     /// Re-runs itself under the Redirection Guard mitigation, which is process-wide and permanent.
+    /// Links an admin creates stay trusted, so the fallback itself only runs for non-admin users.
     #[cfg(windows)]
     #[test]
     fn untrusted_links_are_replaced_with_hard_links_and_copies() {
@@ -776,6 +777,15 @@ mod hard_link_tests {
             assert!(status.success());
             return;
         }
+        let root = std::env::temp_dir().join(format!("orx-untrusted-{}", uuid::Uuid::new_v4()));
+        let legacy = root.join("legacy");
+        let isolated = root.join("isolated");
+        std::fs::create_dir_all(legacy.join("skills")).unwrap();
+        std::fs::write(legacy.join("config.toml"), "config").unwrap();
+        std::fs::write(legacy.join("skills/SKILL.md"), "skill").unwrap();
+        let sources = [legacy.join("config.toml"), legacy.join("skills")];
+        // Links made before the guard was on stand in for a store an older build created.
+        prepare_links(&isolated, &legacy, &sources).unwrap();
         let enforce: u32 = 1;
         assert_ne!(
             unsafe {
@@ -787,19 +797,12 @@ mod hard_link_tests {
             },
             0
         );
-        let root = std::env::temp_dir().join(format!("orx-untrusted-{}", uuid::Uuid::new_v4()));
-        let legacy = root.join("legacy");
-        let isolated = root.join("isolated");
-        std::fs::create_dir_all(legacy.join("skills")).unwrap();
-        std::fs::write(legacy.join("config.toml"), "config").unwrap();
-        std::fs::write(legacy.join("skills/SKILL.md"), "skill").unwrap();
+        prepare_links(&isolated, &legacy, &sources).unwrap();
 
-        prepare_links(
-            &isolated,
-            &legacy,
-            &[legacy.join("config.toml"), legacy.join("skills")],
-        )
-        .unwrap();
+        for name in ["config.toml", "skills"] {
+            let path = isolated.join(name);
+            assert!(!untrusted_link(&path));
+        }
 
         assert_eq!(
             std::fs::read_to_string(isolated.join("config.toml")).unwrap(),
