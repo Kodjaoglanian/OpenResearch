@@ -5,7 +5,7 @@ import { useVirtualizer, defaultRangeExtractor, type Range as VirtualRange } fro
 import { markLiveUpdate } from "../queries/live";
 import { removeSession as removeCachedSession } from "../queries/invalidation";
 import { nativeOptions, sessionAcpHarness } from "../acp";
-import { setChatConfiguration, timeAgo } from "../api";
+import { setChatConfiguration } from "../api";
 import {
   isCurrentScope,
   setScopedQueryData,
@@ -90,6 +90,7 @@ import {
   cancelQueuedMessage,
   chatAttachmentUrl,
   createChatSession,
+  openSideChat,
   getChatSession,
   deleteChatSession,
   DEMO_FIGURE_SESSION_ID,
@@ -192,7 +193,6 @@ import {
   defaultSelection,
   harnessLabel,
   ModelPicker,
-  OptionPicker,
   usePopover,
   type ModelSelection,
 } from "./ModelPicker";
@@ -3920,33 +3920,6 @@ type SessionFilter = "active" | "archived" | "all";
 const matchesFilter = (filter: SessionFilter, archived: boolean) =>
   filter === "all" ? true : filter === "archived" ? archived : !archived;
 
-function SideChatPicker({ parentId, sessions, onSelect, onCreate }: {
-  parentId: string;
-  sessions: ChatSession[];
-  onSelect: (sessionId: string) => void;
-  onCreate: () => void;
-}) {
-  const children = sessions.filter((session) => session.sideParentSessionId === parentId)
-    .sort((a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id));
-  return <OptionPicker
-    triggerLabel={m.side_chat_list({ count: children.length })}
-    choices={children.map((session) => ({
-      id: session.id,
-      label: session.title?.trim() || m.side_chat_untitled(),
-      description: timeAgo(session.updatedAt),
-    }))}
-    value=""
-    dropDown
-    align="right"
-    searchPlaceholder={m.side_chat_search()}
-    menuAction={{ label: m.side_chat_new(), onSelect: onCreate }}
-    renderLabel={(choice) => <span className="block max-w-60 truncate">{choice.label}</span>}
-    renderIcon={(choice) => children.find((session) => session.id === choice.id)?.busy
-      ? <Spinner /> : <MessagesSquare size={14} />}
-    onSelect={onSelect}
-  />;
-}
-
 /** Whether an event target sits inside the side-chat pane. */
 function inSideChat(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest("[data-side-chat]") !== null;
@@ -4293,7 +4266,6 @@ export function ChatPanel({
   onOpenPlan,
   onOpenSubagent,
   runtime,
-  onOpenDemoWelcome,
   composerFocusNonce = 0,
   activeSessionId,
   onActiveSessionChange,
@@ -4302,8 +4274,8 @@ export function ChatPanel({
   preferredAutonomy,
   onPreferredAutonomyChange,
   embedded = false,
+  sideParentSessionId,
   onOpenSideChat,
-  onSelectSideChat,
   onRunSetup,
   children,
 }: {
@@ -4360,8 +4332,6 @@ export function ChatPanel({
     intent: TabOpenIntent,
   ) => void;
   runtime: RuntimeInfo;
-  /** Reopen the demo welcome modal from the chat header. */
-  onOpenDemoWelcome?: () => void;
   /** Increments when the demo welcome hands focus to the composer. */
   composerFocusNonce?: number;
   /** Demo run currently executing, for the monitor-it hint above the composer. */
@@ -4375,9 +4345,9 @@ export function ChatPanel({
   /** A second instance hosting a side chat in the right pane: no rail, and
    * global shortcuts act on it only while focus is inside it. */
   embedded?: boolean;
+  sideParentSessionId?: string;
   /** Branch a side chat off `parentSessionId`; a question, if given, is its first message. */
   onOpenSideChat?: (parentSessionId: string, question: string) => void;
-  onSelectSideChat?: (sessionId: string) => void;
   /** Middle-pane content when a settings section is active. */
   children?: React.ReactNode;
 }) {
@@ -4386,6 +4356,7 @@ export function ChatPanel({
   const setChatSessionAutonomyMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionAutonomy>) => setChatSessionAutonomy(...args) });
   const setChatSessionGoalMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionGoal>) => setChatSessionGoal(...args) });
   const importNativeChatMutation = useMutation({ mutationFn: (args: Parameters<typeof importNativeChat>) => importNativeChat(...args) });
+  const openSideChatMutation = useMutation({ mutationFn: openSideChat });
   const createChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof createChatSession>) => createChatSession(...args) });
   const setChatSessionArchivedMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionArchived>) => setChatSessionArchived(...args) });
   const renameChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof renameChatSession>) => renameChatSession(...args) });
@@ -5016,7 +4987,8 @@ export function ChatPanel({
       case "new":
         // In a side chat, a new chat is another side chat off the same parent.
         if (embedded) {
-          if (openSession?.sideParentSessionId) onOpenSideChat?.(openSession.sideParentSessionId, "");
+          const parent = openSession?.sideParentSessionId ?? sideParentSessionId;
+          if (parent) onOpenSideChat?.(parent, "");
         } else startNewTask();
         return false;
       case "resume":
@@ -5869,19 +5841,21 @@ export function ChatPanel({
   async function openNewSession(selection: ModelSelection, planMode: boolean | undefined) {
     const scope = composerScopeRef.current;
     const visit = projectVisitRef.current;
-    const session = await createChatSessionMutation.mutateAsync([projectId, selection.harness, {
-      model: selection.model,
-      serviceTier: selection.serviceTier,
-      permissionMode: selection.permissionMode,
-      planMode,
-      reasoningLevel: selection.reasoningLevel,
-      autonomy: preferredAutonomy,
-    }]);
-    if (projectVisitRef.current === visit) {
+    const session = sideParentSessionId
+      ? await openSideChatMutation.mutateAsync(sideParentSessionId)
+      : await createChatSessionMutation.mutateAsync([projectId, selection.harness, {
+        model: selection.model,
+        serviceTier: selection.serviceTier,
+        permissionMode: selection.permissionMode,
+        planMode,
+        reasoningLevel: selection.reasoningLevel,
+        autonomy: preferredAutonomy,
+      }]);
+    if (isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit) {
       setSessions((cur) => [session, ...cur.filter((row) => row.id !== session.id)]);
       if (!queryClient.getQueryData(sessionsOptions.queryKey)) void syncSessionList(true);
     }
-    if (projectVisitRef.current === visit && composerScopeRef.current === scope) {
+    if (isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit && composerScopeRef.current === scope) {
       onActiveSessionChangeRef.current(session.id, { replace: true });
       composerScopeRef.current = { ...scope, activeId: session.id };
     }
@@ -6500,7 +6474,7 @@ export function ChatPanel({
     </aside>
   );
 
-  const headerClass = `chat-header flex items-center gap-2 py-0 px-4 bg-background shrink-0 h-12 relative z-20 w-full max-w-readable my-0 mx-auto [&::after]:content-[''] [&::after]:absolute [&::after]:top-full [&::after]:start-0 [&::after]:end-0 [&::after]:h-6 [&::after]:bg-[linear-gradient(to_bottom,_var(--base),_transparent)] [&::after]:pointer-events-none`;
+  const headerClass = `chat-header flex items-center gap-2 py-0 px-4 bg-background shrink-0 h-12 relative z-4 w-full max-w-readable my-0 mx-auto [&::after]:content-[''] [&::after]:absolute [&::after]:top-full [&::after]:start-0 [&::after]:end-0 [&::after]:h-6 [&::after]:bg-[linear-gradient(to_bottom,_var(--base),_transparent)] [&::after]:pointer-events-none`;
   const railReopen = !railOpen && !embedded && (
     <IconButton
       title={m.chat_panel_show_sidebar()}
@@ -6553,26 +6527,9 @@ export function ChatPanel({
               </span>
             </>}
           </div>
-          {!embedded && activeSession && onSelectSideChat && onOpenSideChat && (
-            <SideChatPicker
-              parentId={activeSession.id}
-              sessions={sessions}
-              onSelect={onSelectSideChat}
-              onCreate={() => onOpenSideChat(activeSession.id, "")}
-            />
-          )}
           {embedded && activeSession && (
             <IconButton aria-label={m.side_chat_delete()} data-tip={m.side_chat_delete()} onClick={() => void removeSession(activeSession)}>
               <Trash2 size={15} />
-            </IconButton>
-          )}
-          {onOpenDemoWelcome && (
-            <IconButton
-              data-tip={m.chat_panel_about_this_demo()}
-              aria-label={m.chat_panel_about_this_demo()}
-              onClick={onOpenDemoWelcome}
-            >
-              <HelpCircle size={15} />
             </IconButton>
           )}
           </div>
@@ -6605,7 +6562,7 @@ export function ChatPanel({
               <div className="ms-auto h-16 w-1/2 shrink-0 rounded-lg bg-panel" />
             </div>
           </div>
-        ) : !threadMounted && activeSession?.sideParentSessionId ? (
+        ) : !threadMounted && (activeSession?.sideParentSessionId || sideParentSessionId) ? (
           <div className="chat-empty flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-subtext">
             <MessagesSquare size={22} />
             <p className="m-0 text-balance">{m.side_chat_empty()}</p>
@@ -7257,7 +7214,7 @@ export function ChatPanel({
                   onSelectReasoning={setReasoningLevel}
                   autonomy={openSession?.autonomy ?? preferredAutonomy}
                   onSelectAutonomy={setAutonomy}
-                  lockHarness={!!openSession}
+                  lockHarness={!!openSession || !!sideParentSessionId}
                   openRequest={modelPickerRequest}
                   nativeOptions={openSession?.harness.startsWith("acp:") ? acpOptions.filter((option) => option.category !== "model") : []}
                   onSelectNativeOption={(optionId, value) => {

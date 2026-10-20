@@ -8386,10 +8386,6 @@ async fn process_run_monitoring_alerts(
 
 // --- spawned agents -------------------------------------------------------------
 
-/// How much of a helper's closing reply, and of the brief echoed back with it,
-/// rides into the parent's context. Both are agent-authored and unbounded; the
-/// user can open the helper's session for the rest.
-/// Side chats last only as long as the app run that opened them.
 /// Resume explicitly subscribed agent sessions after a run finishes. Busy and
 /// draining sessions retain their durable wake-up until they become idle.
 pub async fn watch_runs(

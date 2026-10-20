@@ -565,7 +565,7 @@ export function ModelPicker({
  * with a "· Default" note, then the full numbered list. */
 export function OptionPicker({
   triggerIcon,
-  triggerLabel,
+  onTriggerClick,
   menuAction,
   choices,
   value,
@@ -581,11 +581,12 @@ export function OptionPicker({
   renderIcon,
   renderLabel,
   floating = false,
+  openOnHover = false,
   onSelect,
   className,
 }: {
   triggerIcon?: ReactNode;
-  triggerLabel?: ReactNode;
+  onTriggerClick?: () => void;
   menuAction?: { label: string; onSelect: () => void };
   choices: OptionChoice[];
   value: string | null;
@@ -606,6 +607,7 @@ export function OptionPicker({
   renderIcon?: (choice: OptionChoice) => ReactNode;
   renderLabel?: (choice: OptionChoice) => ReactNode;
   floating?: boolean;
+  openOnHover?: boolean;
   onSelect: (id: string) => void;
   className?: string;
 }) {
@@ -613,6 +615,9 @@ export function OptionPicker({
   const { open, setOpen, ref } = usePopover(buttonRef);
   const menuRef = useRef<HTMLDivElement>(null);
   const [filter, setFilter] = useState("");
+  const openedByHover = useRef(false);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(closeTimer.current), []);
   useLayoutEffect(() => {
     const menu = menuRef.current;
     const anchor = ref.current;
@@ -659,6 +664,17 @@ export function OptionPicker({
   const visible = rest.filter((c) => `${c.label} ${c.id}`.toLowerCase().includes(filter.toLowerCase()));
   const label = current?.label ?? choices[0]?.label ?? "";
 
+  const activateTrigger = () => {
+    openedByHover.current = false;
+    setFilter("");
+    if (onTriggerClick) {
+      setOpen(false);
+      onTriggerClick();
+    } else {
+      setOpen((value) => !value);
+    }
+  };
+
   const choose = (id: string) => {
     onSelect(id);
     setOpen(false);
@@ -666,16 +682,42 @@ export function OptionPicker({
   };
 
   return (
-    <div className={`option-picker relative inline-flex${variant === "field" ? " w-full" : ""}`} ref={ref}>
+    <div className={`option-picker relative inline-flex${variant === "field" ? " w-full" : ""}`} ref={ref}
+      onPointerEnter={(event) => {
+        if (!openOnHover || disabled || event.pointerType !== "mouse") return;
+        clearTimeout(closeTimer.current);
+        if (!open) {
+          openedByHover.current = true;
+          setFilter("");
+          setOpen(true);
+        }
+      }}
+      onPointerLeave={() => {
+        if (!openOnHover) return;
+        closeTimer.current = setTimeout(() => {
+          if (!menuRef.current?.contains(document.activeElement)) setOpen(false);
+        }, 150);
+      }}
+    >
       {triggerIcon ? (
         <IconButton
           ref={buttonRef}
           size="small"
+          active={open}
+          className={className}
           aria-label={title ?? header ?? label}
           aria-haspopup="menu"
           aria-expanded={open}
           disabled={disabled}
-          onClick={() => { setFilter(""); setOpen((v) => !v); }}
+          onClick={activateTrigger}
+          onKeyDown={(event) => {
+            if (!onTriggerClick || event.key !== "ArrowDown") return;
+            event.preventDefault();
+            openedByHover.current = false;
+            setFilter("");
+            setOpen(true);
+            menuRef.current?.querySelector("input")?.focus();
+          }}
         >
           {triggerIcon}
         </IconButton>
@@ -693,11 +735,11 @@ export function OptionPicker({
         aria-haspopup="menu"
         aria-expanded={open}
         disabled={disabled}
-        onClick={() => { setFilter(""); setOpen((v) => !v); }}
+        onClick={activateTrigger}
       >
         <span className="inline-flex min-w-0 items-center gap-2">
-          {triggerLabel === undefined && current && renderIcon?.(current)}
-          <span className="truncate">{triggerLabel ?? (current ? renderLabel?.(current) ?? label : label)}</span>
+          {current && renderIcon?.(current)}
+          <span className="truncate">{current ? renderLabel?.(current) ?? label : label}</span>
         </span>
         <ChevronDown size={12} />
       </button>
@@ -712,7 +754,7 @@ export function OptionPicker({
             buttonRef.current?.focus();
             menuAction.onSelect();
           }}><span className="flex items-center gap-2"><Plus size={14} />{menuAction.label}</span></MenuItem>}
-          {searchPlaceholder && <input autoFocus aria-label={searchPlaceholder} placeholder={searchPlaceholder} value={filter} onChange={(e) => setFilter(e.target.value)} className="shrink-0 border-b border-border bg-background px-2 py-2 text-sm outline-none" />}
+          {searchPlaceholder && <input autoFocus={!openedByHover.current} aria-label={searchPlaceholder} placeholder={searchPlaceholder} value={filter} onChange={(e) => setFilter(e.target.value)} className="mb-2 shrink-0 border-b border-border bg-background px-2 py-2 text-sm outline-none" />}
           <div className="min-h-0 overflow-y-auto">
           {pinned && (
             <>
