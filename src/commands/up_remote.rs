@@ -91,6 +91,9 @@ pub(crate) struct RemoteSessionInfo {
     pub dashboard_protocol: Option<u32>,
     pub gateway_url: String,
     pub error: Option<String>,
+    /// The repair command the dashboard can offer to run on the host when the
+    /// current error is a permission rejection `chmod` can address.
+    pub repair_command: Option<String>,
     pub install_paths: Option<RemoteInstallPathsInfo>,
     pub ui_preferences: RemoteUiPreferences,
     pub can_start_new_host: bool,
@@ -204,6 +207,7 @@ impl RemoteSessionManager {
             dashboard_protocol: None,
             gateway_url: format!("http://127.0.0.1:{port}"),
             error: None,
+            repair_command: None,
             install_paths: None,
             ui_preferences: preferences,
             can_start_new_host: false,
@@ -300,6 +304,7 @@ async fn set_session_state(
     let mut info = session.info.write().await;
     info.status = status;
     info.error = error;
+    info.repair_command = None;
 }
 
 async fn set_session_state_if_current(
@@ -311,6 +316,7 @@ async fn set_session_state_if_current(
     update_session_if_current(session, generation, |info| {
         info.status = status;
         info.error = error;
+        info.repair_command = None;
     })
     .await
 }
@@ -424,12 +430,12 @@ async fn prepare_remote_session_inner(session: Arc<RemoteSession>, generation: u
             return;
         }
         Err(error) => {
-            set_session_state_if_current(
-                &session,
-                generation,
-                RemoteSessionStatus::Disconnected,
-                Some(error.to_string()),
-            )
+            let repair_command = repair_command_for(&error);
+            update_session_if_current(&session, generation, |info| {
+                info.status = RemoteSessionStatus::Disconnected;
+                info.error = Some(error.to_string());
+                info.repair_command = repair_command;
+            })
             .await;
             return;
         }
@@ -636,12 +642,12 @@ async fn install_and_connect(
     let (paths, remote_orx, protocol) = match result {
         Ok(result) => result,
         Err(error) => {
-            set_session_state_if_current(
-                &session,
-                generation,
-                RemoteSessionStatus::Disconnected,
-                Some(error.to_string()),
-            )
+            let repair_command = repair_command_for(&error);
+            update_session_if_current(&session, generation, |info| {
+                info.status = RemoteSessionStatus::Disconnected;
+                info.error = Some(error.to_string());
+                info.repair_command = repair_command;
+            })
             .await;
             return Err(error);
         }
@@ -1122,6 +1128,7 @@ fn gateway_router(session: Arc<RemoteSession>) -> Router {
     Router::new()
         .route("/_orx/runtime", get(gateway_runtime))
         .route("/_orx/ssh/connect", get(gateway_ssh_connect))
+        .route("/_orx/ssh/repair", get(gateway_ssh_repair))
         .route("/_orx/install", post(gateway_install))
         .route("/_orx/reconnect", post(gateway_reconnect))
         .route("/_orx/start-host", post(gateway_start_new_host))
@@ -1151,6 +1158,25 @@ async fn gateway_ssh_connect(
         );
     }
     super::up::ssh_connect_to_target(headers, ws, req, session.target.clone()).await
+}
+
+async fn gateway_ssh_repair(
+    State(session): State<Arc<RemoteSession>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let (host, command) = {
+        let info = session.info.read().await;
+        (info.host.clone(), info.repair_command.clone())
+    };
+    let Some(command) = command else {
+        return gateway_error(
+            StatusCode::BAD_REQUEST,
+            "No repair is pending for this session.".into(),
+        );
+    };
+    // The command stays server-derived: the client only asks for it to run.
+    super::up::ssh_run_to_target(headers, ws, host, session.target.clone(), command).await
 }
 
 pub(crate) async fn loopback_guard(request: Request, next: Next) -> Response {
@@ -1778,6 +1804,45 @@ struct RemoteOrxRejection {
     writable: Vec<String>,
 }
 
+impl RemoteOrxRejection {
+    /// The `chmod` that clears every writable entry, when the rejection is one
+    /// chmod can address. Ownership problems still need a manual repair.
+    fn repair_command(&self) -> Option<String> {
+        (!self.writable.is_empty()).then(|| {
+            format!(
+                "chmod go-w {}",
+                self.writable
+                    .iter()
+                    .map(|path| crate::jobs::ssh::sh_quote(path))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        })
+    }
+}
+
+/// The rejection packaged as an error so the repair command travels with the
+/// diagnostic to the session state that reports it.
+#[derive(Debug)]
+struct RemoteOrxRejected {
+    host: String,
+    rejection: RemoteOrxRejection,
+}
+
+impl std::fmt::Display for RemoteOrxRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&remote_orx_rejection_message(&self.host, &self.rejection))
+    }
+}
+
+impl std::error::Error for RemoteOrxRejected {}
+
+fn repair_command_for(error: &crate::error::Error) -> Option<String> {
+    error
+        .downcast_ref::<RemoteOrxRejected>()
+        .and_then(|rejected| rejected.rejection.repair_command())
+}
+
 fn parse_remote_orx_rejection(output: &str) -> Option<RemoteOrxRejection> {
     let path = marker_value(output, REMOTE_REJECTED_MARKER)?;
     Some(RemoteOrxRejection {
@@ -1797,6 +1862,13 @@ fn parse_remote_orx_rejection(output: &str) -> Option<RemoteOrxRejection> {
 /// that fixing ownership or permissions is an explicit manual step — a shared
 /// install directory is never modified automatically.
 fn remote_orx_rejection_error(host: &str, rejection: &RemoteOrxRejection) -> crate::error::Error {
+    crate::error::Error::new(RemoteOrxRejected {
+        host: host.to_string(),
+        rejection: rejection.clone(),
+    })
+}
+
+fn remote_orx_rejection_message(host: &str, rejection: &RemoteOrxRejection) -> String {
     let mut problems = Vec::new();
     if rejection.not_owned {
         problems.push(format!(
@@ -1825,7 +1897,7 @@ fn remote_orx_rejection_error(host: &str, rejection: &RemoteOrxRejection) -> cra
         .map(|path| crate::jobs::ssh::sh_quote(path))
         .collect::<Vec<_>>()
         .join(" ");
-    anyhow!(
+    format!(
         "An `orx` binary exists on '{host}' at {path}, but OpenResearch will not run it: {problems}. \
          Inspect it over SSH with `ls -ld {inspect}` and repair the permissions or ownership yourself \
          (for example `chmod go-w` on writable paths); OpenResearch does not modify an intentionally shared directory.",
@@ -2422,6 +2494,7 @@ mod tests {
                 dashboard_protocol: None,
                 gateway_url: "http://127.0.0.1:1".into(),
                 error: None,
+                repair_command: None,
                 install_paths: None,
                 ui_preferences: RemoteUiPreferences::default(),
                 can_start_new_host: false,
@@ -2810,6 +2883,35 @@ mod tests {
         assert_eq!(updated.binary, "/opt/openresearch/bin/orx");
         assert_eq!(updated.database, current.database);
         assert_eq!(updated.cache, current.cache);
+    }
+
+    #[test]
+    fn rejection_error_carries_a_scoped_quoted_repair_command() {
+        let rejection = RemoteOrxRejection {
+            path: "/home/u/.cargo/bin/orx".into(),
+            not_owned: false,
+            writable: vec!["/home/u/.cargo/bin/orx".into(), "/home/u/.cargo/bin".into()],
+        };
+        assert_eq!(
+            rejection.repair_command().as_deref(),
+            Some("chmod go-w '/home/u/.cargo/bin/orx' '/home/u/.cargo/bin'")
+        );
+        let error = remote_orx_rejection_error("mybox", &rejection);
+        assert_eq!(
+            repair_command_for(&error).as_deref(),
+            Some("chmod go-w '/home/u/.cargo/bin/orx' '/home/u/.cargo/bin'")
+        );
+
+        // Ownership-only rejections offer no chmod: it cannot fix ownership.
+        let error = remote_orx_rejection_error(
+            "mybox",
+            &RemoteOrxRejection {
+                path: "/x/orx".into(),
+                not_owned: true,
+                writable: vec![],
+            },
+        );
+        assert_eq!(repair_command_for(&error), None);
     }
 
     #[test]
