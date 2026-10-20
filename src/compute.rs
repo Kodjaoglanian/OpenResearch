@@ -814,6 +814,7 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         ssh_container: None,
         monitoring_error: None,
         cancellation_accepted: false,
+        rental_lease: None,
         kind: format!("{}_job", backend_id),
         namespace: None,
         job_id: None,
@@ -857,7 +858,7 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         None => None,
     };
     let identity = args.invocation_identity()?;
-    let report = (!args.telemetry_suppressed)
+    let report = (!args.telemetry_suppressed && backend_id != "openresearch")
         .then(|| {
             crate::telemetry::pending_event_payload(
                 "experiment_finished",

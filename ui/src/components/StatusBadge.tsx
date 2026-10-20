@@ -14,6 +14,7 @@ export const STATUS_STYLES: Record<string, StatusStyle> = {
   starting: { tone: "warning", live: true },
   cancelling: { tone: "caution", live: true },
   cancelled: { tone: "caution", live: false },
+  lost: { tone: "neutral", live: false },
   editing: { tone: "accent", live: true },
   idle: { tone: "neutral", live: false },
 };
@@ -29,6 +30,7 @@ const STATUS_LABELS: Record<string, () => string> = {
   starting: m.status_starting,
   cancelling: m.status_cancelling,
   cancelled: m.status_cancelled,
+  lost: m.status_lost,
   editing: m.status_editing,
   idle: m.status_idle,
 };

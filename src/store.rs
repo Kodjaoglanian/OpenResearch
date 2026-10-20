@@ -267,16 +267,19 @@ pub enum RunStatus {
     Failed,
     /// Terminal: cancellation was requested and honored.
     Cancelled,
+    /// Terminal: the rental ended before its execution outcome could be retrieved.
+    Lost,
 }
 
 impl RunStatus {
     #[cfg(test)]
-    const ALL: [RunStatus; 5] = [
+    const ALL: [RunStatus; 6] = [
         Self::Starting,
         Self::Running,
         Self::Done,
         Self::Failed,
         Self::Cancelled,
+        Self::Lost,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -286,6 +289,7 @@ impl RunStatus {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Lost => "lost",
         }
     }
 
@@ -299,21 +303,25 @@ impl RunStatus {
             "done" => Self::Done,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
+            "lost" => Self::Lost,
             _ => return None,
         })
     }
 
     /// A run in a terminal state is finished and will never change again.
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Done | Self::Failed | Self::Cancelled | Self::Lost
+        )
     }
 
     fn can_transition_to(self, to: RunStatus) -> bool {
         use RunStatus::*;
         match self {
             Starting => true,
-            Running => matches!(to, Running | Done | Failed | Cancelled),
-            Done | Failed | Cancelled => false,
+            Running => matches!(to, Running | Done | Failed | Cancelled | Lost),
+            Done | Failed | Cancelled | Lost => false,
         }
     }
 }
@@ -4931,10 +4939,12 @@ mod tests {
             (Starting, Done),
             (Starting, Failed),
             (Starting, Cancelled),
+            (Starting, Lost),
             (Running, Running),
             (Running, Done),
             (Running, Failed),
             (Running, Cancelled),
+            (Running, Lost),
         ];
         for from in RunStatus::ALL {
             for to in RunStatus::ALL {
@@ -5021,7 +5031,7 @@ mod tests {
                 status.is_terminal(),
                 matches!(
                     status,
-                    RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled
+                    RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Lost
                 )
             );
         }
