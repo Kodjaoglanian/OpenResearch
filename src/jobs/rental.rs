@@ -154,6 +154,17 @@ fn remote_bash_command(script: &str) -> String {
     ))
 }
 
+fn remote_supervisor_command(binary: &str, directory: &str) -> String {
+    use super::ssh::sh_quote;
+    // An asynchronous `cd && nohup` list keeps the SSH output pipes open.
+    format!(
+        "cd {} || exit; nohup {} rental-supervise {} </dev/null > supervisor.log 2>&1 &",
+        sh_quote(directory),
+        sh_quote(binary),
+        sh_quote(&format!("{directory}/rental.json"))
+    )
+}
+
 fn cancel_probe_script(directory: &str) -> String {
     format!(
         "d=\"$HOME/{directory}\"; umask 077; mkdir -p \"$d\"; touch \"$d/cancel_requested\"; \
@@ -220,7 +231,7 @@ pub async fn launch(
         Some(&payload),
     )
     .await?;
-    let command = format!("cd \"$HOME/{directory}\" && nohup {} rental-supervise {} </dev/null > supervisor.log 2>&1 &", sh_quote(binary), sh_quote(&format!("{path}/rental.json")));
+    let command = remote_supervisor_command(binary, &path);
     ssh_run(target, &command, None).await?;
     Ok(())
 }
@@ -228,6 +239,34 @@ pub async fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_launch_returns_without_waiting_for_the_supervisor() {
+        let temp = crate::local::git::TemporaryDirectory::new("orx-rental-detach").unwrap();
+        std::fs::write(
+            temp.path().join("rental-supervise"),
+            "touch started; sleep 2\n",
+        )
+        .unwrap();
+        let command = remote_supervisor_command("/bin/sh", temp.path().to_str().unwrap());
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::process::Command::new("/bin/sh")
+                .args(["-c", &command])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(output.status.success());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !temp.path().join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn cancellation_waits_for_a_pid_or_terminal_acknowledgment() {
