@@ -43,9 +43,10 @@ export function statusLabel(s: string): string {
 
 export function StatusBadge({ status, label, className }: { status: string; label?: string; className?: string }) {
   const style = statusStyle(status);
+  const text = label ?? statusLabel(status);
   return (
     <StatusIndicator tone={style.tone} live={style.live} className={className}>
-      {label ?? statusLabel(status)}
+      <span className="truncate" title={text}>{text}</span>
     </StatusIndicator>
   );
 }

@@ -104,22 +104,26 @@ pub async fn supervise(config: &Path) -> Result<()> {
         .append(true)
         .mode(0o600)
         .open(directory.join("log"))?;
-    let mut child = tokio::process::Command::new("bash")
-        .arg(directory.join("payload.sh"))
-        .current_dir(&directory)
-        .stdin(std::process::Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0)
-        .spawn()?;
-    if let Some(id) = child.id() {
-        std::fs::write(directory.join("pid"), id.to_string())?;
-    }
-    let status = child.wait().await?;
-    use std::os::unix::process::ExitStatusExt;
-    let code = status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    let code = if directory.join("cancel_requested").exists() {
+        143
+    } else {
+        let mut child = tokio::process::Command::new("bash")
+            .arg(directory.join("payload.sh"))
+            .current_dir(&directory)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .process_group(0)
+            .spawn()?;
+        if let Some(id) = child.id() {
+            std::fs::write(directory.join("pid"), id.to_string())?;
+        }
+        let status = child.wait().await?;
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
+    };
     std::fs::write(directory.join("exit_code.tmp"), format!("{code}\n"))?;
     std::fs::rename(directory.join("exit_code.tmp"), directory.join("exit_code"))?;
     File::open(directory.join("log"))?.sync_all()?;
@@ -143,6 +147,34 @@ pub async fn supervise(_config: &Path) -> Result<()> {
     ))
 }
 
+fn remote_bash_command(script: &str) -> String {
+    crate::commands::up_remote::remote_login_orx_cmd(&format!(
+        "bash -c {}",
+        super::ssh::sh_quote(script)
+    ))
+}
+
+fn cancel_probe_script(directory: &str) -> String {
+    format!(
+        "d=\"$HOME/{directory}\"; umask 077; mkdir -p \"$d\"; touch \"$d/cancel_requested\"; \
+         for ((i=0;i<40;i++)); do \
+         if [ -f \"$d/exit_code\" ]; then echo EXIT; exit 0; fi; \
+         if [ -f \"$d/pid\" ]; then echo PID; exit 0; fi; sleep 0.25; done; \
+         echo 'Waiting for remote supervisor to acknowledge cancellation' >&2; exit 1"
+    )
+}
+
+pub async fn cancel(target: &super::ssh::SshTarget, directory: &str) -> Result<()> {
+    use super::ssh::{sh_quote, ssh_run};
+    let script = cancel_probe_script(directory);
+    let state = ssh_run(target, &format!("bash -c {}", sh_quote(&script)), None).await?;
+    match state.trim() {
+        "EXIT" => Ok(()),
+        "PID" => super::ssh::cancel_job(target, directory, None).await,
+        _ => Err(anyhow!("Remote cancellation has not been acknowledged")),
+    }
+}
+
 pub async fn launch(
     target: &super::ssh::SshTarget,
     run_id: &str,
@@ -159,12 +191,7 @@ pub async fn launch(
          curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/0.8.22/install.sh | env UV_NO_MODIFY_PATH=1 sh; fi; \
          if ! command -v orx >/dev/null || ! orx rental-supervise --help >/dev/null 2>&1; then {installer}; fi; command -v orx"
     );
-    let output = ssh_run(
-        target,
-        &crate::commands::up_remote::remote_login_orx_cmd(&install),
-        None,
-    )
-    .await?;
+    let output = ssh_run(target, &remote_bash_command(&install), None).await?;
     let binary = output
         .lines()
         .last()
@@ -181,7 +208,7 @@ pub async fn launch(
     );
     ssh_run(target, &setup, Some(&serde_json::to_string(&config)?)).await?;
     let mut payload = String::from(
-        "#!/usr/bin/env bash\nexport PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"\n",
+        "#!/usr/bin/env bash\nexport PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"\n[ ! -f cancel_requested ] || exit 143\n",
     );
     for (name, value) in super::default_python_env(env) {
         payload.push_str(&format!("export {name}={}\n", sh_quote(&value)));
@@ -201,6 +228,46 @@ pub async fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_waits_for_a_pid_or_terminal_acknowledgment() {
+        let temp = crate::local::git::TemporaryDirectory::new("orx-rental-cancel").unwrap();
+        let invoke = || {
+            std::process::Command::new("bash")
+                .args(["-c", &cancel_probe_script("run")])
+                .env("HOME", temp.path())
+                .output()
+                .unwrap()
+        };
+        let pending = invoke();
+        assert!(!pending.status.success());
+        assert!(temp.path().join("run/cancel_requested").exists());
+        std::fs::write(temp.path().join("run/exit_code"), "143\n").unwrap();
+        let acknowledged = invoke();
+        assert!(acknowledged.status.success());
+        assert_eq!(String::from_utf8_lossy(&acknowledged.stdout).trim(), "EXIT");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rental_bootstrap_runs_bash_syntax_through_the_posix_login_shell() {
+        let home = crate::local::git::TemporaryDirectory::new("orx-rental-shell").unwrap();
+        let script = remote_bash_command("values=(first second); printf '%s' \"${values[1]}\"");
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .env("HOME", home.path())
+            .env("SHELL", "/bin/sh")
+            .env("ENV", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "second");
+    }
+
     #[test]
     fn rental_debug_does_not_expose_capability() {
         let rental = Rental {
@@ -224,26 +291,39 @@ mod tests {
         };
         use std::sync::{Arc, Mutex};
         type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
-        for (exit, acknowledge) in [(0, true), (7, true), (0, false)] {
+        for (exit, acknowledge, cancel_before_spawn) in [
+            (0, true, false),
+            (7, true, false),
+            (0, false, false),
+            (143, true, true),
+        ] {
             let requests = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+            let temp = crate::local::git::TemporaryDirectory::new("orx-rental-test").unwrap();
+            let directory = temp.path().to_path_buf();
             async fn record(
                 Path(operation): Path<String>,
-                State(requests): State<Requests>,
+                State((requests, directory, cancel_before_spawn)): State<(
+                    Requests,
+                    std::path::PathBuf,
+                    bool,
+                )>,
                 body: Bytes,
             ) -> StatusCode {
+                if operation == "activate" && cancel_before_spawn {
+                    std::fs::write(directory.join("cancel_requested"), "").unwrap();
+                }
                 requests.lock().unwrap().push((operation, body.to_vec()));
                 StatusCode::NO_CONTENT
             }
             let app = Router::new()
                 .route("/sandboxes/rental/lease/{operation}", post(record))
-                .with_state(requests.clone());
+                .with_state((requests.clone(), directory.clone(), cancel_before_spawn));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            let temp = crate::local::git::TemporaryDirectory::new("orx-rental-test").unwrap();
-            let directory = temp.path().to_path_buf();
+
             std::fs::write(
                 directory.join("payload.sh"),
                 format!("printf 'private experiment output\n'; exit {exit}\n"),
@@ -284,9 +364,13 @@ mod tests {
                     .trim(),
                 exit.to_string()
             );
-            assert!(std::fs::read_to_string(directory.join("log"))
-                .unwrap()
-                .contains("private experiment output"));
+            let log = std::fs::read_to_string(directory.join("log")).unwrap();
+            if cancel_before_spawn {
+                assert!(log.is_empty());
+                assert!(!directory.join("pid").exists());
+            } else {
+                assert!(log.contains("private experiment output"));
+            }
             let captured = requests.lock().unwrap();
             assert_eq!(captured.first().unwrap().0, "activate");
             assert_eq!(captured.last().unwrap().0, "release");

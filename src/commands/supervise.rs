@@ -697,7 +697,15 @@ async fn watch_ssh_job(
 
     loop {
         if !cancel_sent && local_cancel_requested(store, run_id) {
-            cancel_ssh(&target, &dir, container.as_ref(), run_id, &mut cancel_sent).await;
+            cancel_ssh(
+                &target,
+                &dir,
+                container.as_ref(),
+                descriptor.rental_lease.is_some(),
+                run_id,
+                &mut cancel_sent,
+            )
+            .await;
         }
         let observed = ssh::inspect_job(&target, &dir, container.as_ref()).await;
         let polling_error = observed
@@ -774,19 +782,21 @@ async fn watch_ssh_job(
             missing_polls = 0;
         }
         let mut job = job;
+        let mut exit_code = None;
         if descriptor.rental_lease.is_some() && is_terminal_stage(&job.stage) {
-            let code = ssh::ssh_run(&target, &format!("cat \"$HOME/{dir}/exit_code\""), None)
+            exit_code = ssh::ssh_run(&target, &format!("cat \"$HOME/{dir}/exit_code\""), None)
                 .await
                 .ok()
                 .and_then(|value| value.trim().parse::<i64>().ok());
-            if code.is_none() {
-                if let Some((creds, id)) = sandbox {
-                    if openresearch::box_deleted(creds, id).await {
-                        job.stage = "LOST".into();
-                    } else {
-                        tokio::time::sleep(POLL_INTERVAL).await;
-                        continue;
-                    }
+            if let Some(code) = exit_code {
+                job.stage = if code == 0 { "COMPLETED" } else { "ERROR" }.into();
+                job.message = (code != 0).then(|| format!("exited with code {code}"));
+            } else if let Some((creds, id)) = sandbox {
+                if openresearch::box_deleted(creds, id).await {
+                    job.stage = "LOST".into();
+                } else {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
                 }
             }
         }
@@ -802,14 +812,6 @@ async fn watch_ssh_job(
             if !collected {
                 log_task.abort();
             }
-            let exit_code = if descriptor.rental_lease.is_some() && stage != "LOST" {
-                ssh::ssh_run(&target, &format!("cat \"$HOME/{dir}/exit_code\""), None)
-                    .await
-                    .ok()
-                    .and_then(|code| code.trim().parse::<i64>().ok())
-            } else {
-                None
-            };
             let applied = store.update_status(run_id, status, Some(now_ms()), exit_code)?;
             if applied && matches!(status, RunStatus::Failed | RunStatus::Lost) {
                 if let Some(msg) = &job.message {
@@ -866,10 +868,26 @@ async fn watch_ssh_job(
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
             if cancel_requested && !cancel_sent {
-                cancel_ssh(&target, &dir, container.as_ref(), run_id, &mut cancel_sent).await;
+                cancel_ssh(
+                    &target,
+                    &dir,
+                    container.as_ref(),
+                    descriptor.rental_lease.is_some(),
+                    run_id,
+                    &mut cancel_sent,
+                )
+                .await;
             }
         } else if !cancel_sent && local_cancel_requested(store, run_id) {
-            cancel_ssh(&target, &dir, container.as_ref(), run_id, &mut cancel_sent).await;
+            cancel_ssh(
+                &target,
+                &dir,
+                container.as_ref(),
+                descriptor.rental_lease.is_some(),
+                run_id,
+                &mut cancel_sent,
+            )
+            .await;
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -933,11 +951,17 @@ async fn cancel_ssh(
     target: &ssh::SshTarget,
     dir: &str,
     container: Option<&ssh::ContainerRun>,
+    leased: bool,
     run_id: &str,
     cancel_sent: &mut bool,
 ) {
     eprintln!("supervise {run_id}: cancel requested — killing remote process group");
-    match ssh::cancel_job(target, dir, container).await {
+    let result = if leased {
+        crate::jobs::rental::cancel(target, dir).await
+    } else {
+        ssh::cancel_job(target, dir, container).await
+    };
+    match result {
         Ok(()) => *cancel_sent = true,
         Err(err) => eprintln!("supervise {run_id}: ssh cancel failed (will retry): {err}"),
     }
