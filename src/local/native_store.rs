@@ -469,7 +469,9 @@ fn reconcile_link(source: &Path, destination: &Path) -> Result<()> {
                 preserve_conflict(destination)?;
             }
         }
-        Ok(metadata) if metadata.is_dir() && source.is_dir() && marker.is_file() => {
+        Ok(metadata)
+            if cfg!(windows) && metadata.is_dir() && source.is_dir() && marker.is_file() =>
+        {
             return Ok(copy_tree(source, destination)?);
         }
         Ok(_) => {
@@ -569,6 +571,10 @@ fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(source)? {
         let from = entry?.path();
         let to = destination.join(from.file_name().unwrap_or_default());
+        // A nested link the guard refuses is unreadable to the agent anyway.
+        if untrusted_link(&from) {
+            continue;
+        }
         if from.is_dir() {
             copy_tree(&from, &to)?;
             continue;
@@ -750,6 +756,58 @@ mod hard_link_tests {
         assert_eq!(
             std::fs::read_to_string(destination.join("installed.md")).unwrap(),
             "mine"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Re-runs itself under the Redirection Guard mitigation, which is process-wide and permanent.
+    #[cfg(windows)]
+    #[test]
+    fn untrusted_links_are_replaced_with_hard_links_and_copies() {
+        if std::env::var_os("ORX_TEST_REDIRECTION_GUARD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local::native_store::hard_link_tests::untrusted_links_are_replaced_with_hard_links_and_copies",
+                ])
+                .env("ORX_TEST_REDIRECTION_GUARD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let enforce: u32 = 1;
+        assert_ne!(
+            unsafe {
+                windows_sys::Win32::System::Threading::SetProcessMitigationPolicy(
+                    windows_sys::Win32::System::Threading::ProcessRedirectionTrustPolicy,
+                    std::ptr::from_ref(&enforce).cast(),
+                    std::mem::size_of_val(&enforce),
+                )
+            },
+            0
+        );
+        let root = std::env::temp_dir().join(format!("orx-untrusted-{}", uuid::Uuid::new_v4()));
+        let legacy = root.join("legacy");
+        let isolated = root.join("isolated");
+        std::fs::create_dir_all(legacy.join("skills")).unwrap();
+        std::fs::write(legacy.join("config.toml"), "config").unwrap();
+        std::fs::write(legacy.join("skills/SKILL.md"), "skill").unwrap();
+
+        prepare_links(
+            &isolated,
+            &legacy,
+            &[legacy.join("config.toml"), legacy.join("skills")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(isolated.join("config.toml")).unwrap(),
+            "config"
+        );
+        assert_eq!(
+            std::fs::read_to_string(isolated.join("skills/SKILL.md")).unwrap(),
+            "skill"
         );
         std::fs::remove_dir_all(root).ok();
     }
