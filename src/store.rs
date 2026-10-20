@@ -257,7 +257,7 @@ pub struct StoredRun {
 pub fn public_backend(value: &str) -> Option<serde_json::Value> {
     let mut backend = serde_json::from_str::<serde_json::Value>(value).ok()?;
     if let Some(fields) = backend.as_object_mut() {
-        fields.remove("rental");
+        fields.remove("rentalLease");
     }
     Some(backend)
 }
