@@ -27,25 +27,29 @@ import { absoluteFileUrl, artifactUrl, projectFileUrl } from "../api";
 import { InlineHtmlFigure } from "./InlineHtmlFigure";
 import { ImageCarousel, ImageCarouselContext } from "./ImageCarousel";
 import { imageWheelZoom } from "../imageZoom";
-import { chatImageAssetTarget, chatImageTarget, chatImageTargets, citedFilePath, encodeMarkdownPath, firstCitedLine, htmlFigureAssetTarget, rehypeSafeUrls, splitLineSuffix } from "../markdownTarget";
+import { chatImageTarget, chatImageTargets, citedFilePath, documentAssetTarget, encodeMarkdownPath, firstCitedLine, rehypeSafeUrls, splitLineSuffix, type ImageCandidate } from "../markdownTarget";
 
-const ImageResolverContext = createContext<((src: string, source?: string, attempt?: number) => string[]) | undefined>(undefined);
+const ImageResolverContext = createContext<((src: string) => ImageCandidate[]) | undefined>(undefined);
 
 export function ChatImageScope({ projectId, sessionId, children }: {
   projectId: string;
   sessionId?: string | null;
   children: ReactNode;
 }) {
-  const resolver = useMemo(() => (src: string, source?: string, attempt = 0) => {
-    if (/^(https?:)?\/\//i.test(src)) return [src];
-    const figure = source ? chatImageTargets(source)[attempt] : null;
-    const asset = figure ? chatImageAssetTarget(figure, src) : null;
-    return (source ? asset ? [asset] : [] : chatImageTargets(src)).map(target => {
-      const url = target.source === "absolute" ? absoluteFileUrl(target.path)
-        : target.source === "artifact" ? artifactUrl(projectId, target.path)
-        : projectFileUrl(projectId, target.path, { sessionId: sessionId ?? undefined });
-      return url + target.hash;
-    });
+  const resolver = useMemo(() => {
+    const url = (target: NonNullable<ReturnType<typeof chatImageTarget>>) => (target.source === "absolute" ? absoluteFileUrl(target.path)
+      : target.source === "artifact" ? artifactUrl(projectId, target.path)
+      : projectFileUrl(projectId, target.path, { sessionId: sessionId ?? undefined })) + target.hash;
+    return (src: string): ImageCandidate[] => /^(https?:)?\/\//i.test(src) ? [{ url: src, resolveAsset: () => null }]
+      : chatImageTargets(src).map(target => ({
+        url: url(target),
+        resolveAsset: (child: string) => {
+          const absolute = chatImageTarget(child);
+          if (absolute?.source === "absolute") return url(absolute);
+          const asset = documentAssetTarget(target.path, child, true);
+          return asset ? url({ ...target, path: asset.path, hash: asset.hash }) : null;
+        },
+      }));
   }, [projectId, sessionId]);
   return <ImageResolverContext value={resolver}>{children}</ImageResolverContext>;
 }
@@ -422,31 +426,26 @@ export const Md = memo(function Md({
   ) => void;
   onOpenRun?: (runId: string, intent: TabOpenIntent) => void;
   resolveFilePath?: (path: string) => string | null;
-  resolveImageSrc?: (src: string) => string | null;
+  resolveImageSrc?: (src: string) => ImageCandidate[];
   predict?: boolean;
 }) {
   useLocale();
   const chatImageSrc = useContext(ImageResolverContext);
-  const imageSrc = useMemo(() => resolveImageSrc ? (src: string, source?: string) => {
-    const target = source ? htmlFigureAssetTarget(source, src) : src;
-    const resolved = target ? resolveImageSrc(target) : null;
-    return resolved ? [resolved] : [];
-  } : chatImageSrc, [resolveImageSrc, chatImageSrc]);
+  const imageSrc = resolveImageSrc ?? chatImageSrc;
   // Callers pass fresh callbacks; a new `img` type would remount every image.
   const img = useMemo(() => function MarkdownImg({ node: _node, src, alt, className, ...rest }: any) {
-    const sources = useMemo(() => typeof src === "string" && src ? imageSrc?.(src) ?? [src] : [], [src, imageSrc]);
-    const resolved = sources[0];
+    const sources = useMemo(() => typeof src === "string" && src ? imageSrc?.(src) ?? [{ url: src, resolveAsset: () => null }] : [], [src, imageSrc]);
+    const resolved = sources[0]?.url;
     if (!resolved) return null;
     if (imageSrc && chatImageTarget(src)?.path.match(/\.html?$/i)) {
-      return <InlineHtmlFigure key={resolved} source={src} urls={sources}
-        name={alt || src} resolveSrc={imageSrc} />;
+      return <InlineHtmlFigure key={resolved} candidates={sources} name={alt || src} />;
     }
     return (
       <MarkdownImage
         {...rest}
         key={resolved}
         downloadName={src.split(/[\\/]/).pop()?.split(/[?#]/)[0]}
-        sources={sources}
+        sources={sources.map(source => source.url)}
         alt={alt ?? ""}
         loading="lazy"
         className={`block max-w-full h-auto my-3 rounded-sm border border-border cursor-zoom-in focus-visible:outline-2 focus-visible:outline-primary ${className ?? ""}`}
