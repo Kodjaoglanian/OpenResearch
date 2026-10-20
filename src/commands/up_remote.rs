@@ -1845,16 +1845,23 @@ fn repair_command_for(error: &crate::error::Error) -> Option<String> {
 
 fn parse_remote_orx_rejection(output: &str) -> Option<RemoteOrxRejection> {
     let path = marker_value(output, REMOTE_REJECTED_MARKER)?;
+    // The probe's `find "$p" "$(dirname "$p")" -prune` can only report the
+    // binary or its directory; any other writable marker is an injected line
+    // and must not become a chmod target in the repair command.
+    let parent = path
+        .rsplit_once('/')
+        .map(|(dir, _)| if dir.is_empty() { "/" } else { dir });
     Some(RemoteOrxRejection {
-        path,
-        not_owned: output
-            .lines()
-            .any(|line| line.starts_with(REMOTE_REJECTED_OWNER_MARKER)),
         writable: output
             .lines()
             .filter_map(|line| line.strip_prefix(REMOTE_REJECTED_WRITABLE_MARKER))
             .map(str::to_string)
+            .filter(|entry| entry == &path || Some(entry.as_str()) == parent)
             .collect(),
+        path,
+        not_owned: output
+            .lines()
+            .any(|line| line.starts_with(REMOTE_REJECTED_OWNER_MARKER)),
     })
 }
 
@@ -2899,6 +2906,22 @@ mod tests {
         let error = remote_orx_rejection_error("mybox", &rejection);
         assert_eq!(
             repair_command_for(&error).as_deref(),
+            Some("chmod go-w '/home/u/.cargo/bin/orx' '/home/u/.cargo/bin'")
+        );
+
+        // Injected writable lines beyond the binary and its directory are
+        // dropped: they must never become chmod targets.
+        let injected = format!(
+            "{marker}{path}\n{writable}{path}\n{writable}{dir}\n{writable}/elsewhere/planted\n{writable}relative/path\n",
+            marker = REMOTE_REJECTED_MARKER,
+            writable = REMOTE_REJECTED_WRITABLE_MARKER,
+            path = "/home/u/.cargo/bin/orx",
+            dir = "/home/u/.cargo/bin",
+        );
+        assert_eq!(
+            parse_remote_orx_rejection(&injected)
+                .and_then(|r| r.repair_command())
+                .as_deref(),
             Some("chmod go-w '/home/u/.cargo/bin/orx' '/home/u/.cargo/bin'")
         );
 
