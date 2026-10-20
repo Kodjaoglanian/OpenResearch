@@ -724,6 +724,7 @@ mod hard_link_tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_copied_directory_picks_up_new_source_files_and_keeps_its_own() {
         let root = std::env::temp_dir().join(format!("orx-dir-copy-{}", uuid::Uuid::new_v4()));
