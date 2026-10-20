@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{anyhow, Result};
 
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
+#[cfg(any(unix, test))]
 pub const COLLECTION_GRACE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Serialize, Deserialize)]
