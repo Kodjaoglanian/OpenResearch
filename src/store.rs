@@ -1331,7 +1331,7 @@ impl Store {
 
     pub fn list_ready_run_wakeups(&self) -> Result<Vec<RunWakeup>> {
         self.list_run_wakeups(
-            "w.state IN ('pending', 'claimed') AND r.status IN ('done', 'failed')
+            "w.state IN ('pending', 'claimed') AND r.status IN ('done', 'failed', 'lost')
              ORDER BY COALESCE(r.ended_at, r.updated_at), w.requested_at, r.id",
         )
     }
@@ -5298,6 +5298,25 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lost_run_wakes_its_waiting_chat() {
+        let dir = std::env::temp_dir().join(format!("orx-lost-wake-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_A"))
+            .unwrap();
+        store
+            .upsert_run(&run_fixture("run_lost", "lost", Some("chat_A")))
+            .unwrap();
+        store.register_run_wakeup("run_lost", "chat_A").unwrap();
+        store.prune_run_wakeups().unwrap();
+        let ready = store.list_ready_run_wakeups().unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].run.id, "run_lost");
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
