@@ -8,6 +8,7 @@
 //! Data dir: `$ORX_DATA_DIR`, else `$XDG_DATA_HOME/openresearch`, else
 //! `~/.local/share/openresearch`.
 
+mod acp;
 mod telemetry;
 pub(crate) use telemetry::{InvocationIdentity, TokenUsage};
 
@@ -695,6 +696,11 @@ impl Store {
                 root       TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (project_id, tex_path)
             );
+            CREATE TABLE IF NOT EXISTS acp_sessions (
+                session_id TEXT PRIMARY KEY REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                launch_json TEXT NOT NULL,
+                configuration_json TEXT NOT NULL DEFAULT '[]'
+            );
             CREATE TABLE IF NOT EXISTS ui_state (
                 id                       INTEGER PRIMARY KEY CHECK (id = 1),
                 onboarding_completed     INTEGER NOT NULL DEFAULT 0,
@@ -745,6 +751,7 @@ impl Store {
             "ALTER TABLE chat_sessions ADD COLUMN goal TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN autonomy TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN side_parent_session_id TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN side_parent_leaf_id TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_service_tier TEXT",
             "ALTER TABLE ui_state ADD COLUMN workspace_state_json TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_autonomy TEXT",
@@ -754,6 +761,7 @@ impl Store {
             let _ = conn.execute(ddl, []);
         }
         conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
+        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_acp_session AFTER DELETE ON chat_sessions BEGIN DELETE FROM acp_sessions WHERE session_id = OLD.id; END;")?;
         conn.execute(
             "DELETE FROM native_invocation_identities WHERE session_id IS NULL AND created_at < ?1",
             [now_ms() - 7 * 24 * 60 * 60 * 1000],
@@ -1636,8 +1644,8 @@ impl Store {
                                             title_source, model, service_tier, permission_mode, plan_mode,
                                             plan_reset_pending, reasoning_level,
                                             archived, context_usage_json, bootstrap_context,
-                                            active_leaf_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                                            active_leaf_id, created_at, updated_at, side_parent_session_id, side_parent_leaf_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                 params![
                     session.id,
                     session.project_id,
@@ -1657,8 +1665,13 @@ impl Store {
                     session.active_leaf_id,
                     session.created_at,
                     session.updated_at,
+                    session.side_parent_session_id,
+                    session.side_parent_leaf_id,
                 ],
             )?;
+            if let Some(state) = self.acp_launch_for_session(session)? {
+                self.save_acp_session_state(&session.id, &state)?;
+            }
         }
         for message in messages {
             tx.execute(
@@ -1884,12 +1897,18 @@ impl Store {
     // --- chat sessions / messages ------------------------------------------
 
     pub fn create_chat_session(&self, s: &StoredChatSession) -> Result<()> {
+        let acp_state = self.acp_launch_for_session(s)?;
+        let transaction = if acp_state.is_some() && self.conn.is_autocommit() {
+            Some(self.conn.unchecked_transaction()?)
+        } else {
+            None
+        };
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
                                         service_tier, permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
                                         active_leaf_id, created_at, updated_at, autonomy,
-                                        side_parent_session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                                        side_parent_session_id, side_parent_leaf_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 s.id,
                 s.project_id,
@@ -1910,8 +1929,15 @@ impl Store {
                 s.updated_at,
                 s.autonomy,
                 s.side_parent_session_id,
+                s.side_parent_leaf_id,
             ],
         )?;
+        if let Some(state) = acp_state {
+            self.save_acp_session_state(&s.id, &state)?;
+        }
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -1989,14 +2015,6 @@ impl Store {
             ],
             row_to_chat_session,
         )?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-
-    pub fn side_chat_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id FROM chat_sessions WHERE side_parent_session_id IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -2102,7 +2120,15 @@ impl Store {
     }
 
     pub fn delete_chat_session(&self, id: &str) -> Result<()> {
-        let tx = self.begin()?;
+        let tx = self.begin_immediate()?;
+        let has_children: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_sessions WHERE side_parent_session_id = ?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if has_children {
+            return Err(anyhow!("delete side chats before deleting their parent"));
+        }
         tx.execute(
             "DELETE FROM chat_queued_messages WHERE session_id = ?1",
             params![id],
@@ -3143,6 +3169,8 @@ pub struct StoredChatSession {
     /// Chat this side chat branched from. Side chats share that chat's
     /// worktree, stay out of history, and are deleted with it.
     pub side_parent_session_id: Option<String>,
+    /// Parent branch tip captured when this side chat was created.
+    pub side_parent_leaf_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -3292,7 +3320,7 @@ fn row_to_chat_turn(
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, service_tier, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
      created_at, updated_at, title_source, bootstrap_context, active_leaf_id, \
-     goal, autonomy, side_parent_session_id";
+     goal, autonomy, side_parent_session_id, side_parent_leaf_id";
 
 fn row_to_chat_session(
     row: &rusqlite::Row<'_>,
@@ -3319,6 +3347,7 @@ fn row_to_chat_session(
         goal: row.get(18)?,
         autonomy: row.get(19)?,
         side_parent_session_id: row.get(20)?,
+        side_parent_leaf_id: row.get(21)?,
     })
 }
 
@@ -4409,9 +4438,97 @@ mod tests {
             autonomy: None,
             active_leaf_id: None,
             side_parent_session_id: None,
+            side_parent_leaf_id: None,
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn acp_first_turn_repairs_missing_state_without_redirecting_native_sessions() {
+        let dir = std::env::temp_dir().join(format!("orx-acp-repair-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut session = chat_session_fixture("legacy-demo");
+        session.harness = crate::local::acp::presets()[0].launch.id.clone();
+        store.create_chat_session(&session).unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE session_id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+        let repaired = store
+            .ensure_acp_session_state(&session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.launch.id, session.harness);
+        store
+            .conn
+            .execute(
+                "UPDATE chat_sessions SET native_session_id = 'native' WHERE id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM acp_sessions WHERE session_id = ?1",
+                [&session.id],
+            )
+            .unwrap();
+        assert!(store.ensure_acp_session_state(&session.id).is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn acp_side_chat_keeps_launch_snapshot_and_deletes_its_state() {
+        let dir = std::env::temp_dir().join(format!("orx-acp-store-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let parent = chat_session_fixture("parent");
+        store.create_chat_session(&parent).unwrap();
+        let launch = crate::local::acp::Definition {
+            id: format!("acp:{}", uuid::Uuid::new_v4()),
+            name: "Saved agent".into(),
+            executable: "original-agent".into(),
+            arguments: vec!["original argument".into()],
+        };
+        store.conn.execute(
+            "INSERT INTO acp_sessions(session_id, launch_json, configuration_json) VALUES (?1, ?2, ?3)",
+            params![parent.id, serde_json::to_string(&launch).unwrap(), "[]"],
+        ).unwrap();
+        let mut side = chat_session_fixture("side");
+        side.harness = launch.id.clone();
+        side.side_parent_session_id = Some(parent.id.clone());
+        store.create_chat_session(&side).unwrap();
+        assert_eq!(
+            store.acp_session_state("side").unwrap().unwrap().launch,
+            launch
+        );
+        assert!(store
+            .get_chat_session("side")
+            .unwrap()
+            .unwrap()
+            .native_session_id
+            .is_none());
+        let configuration = serde_json::json!([{"id":"model", "currentValue":"native/model"}]);
+        store.set_acp_configuration("side", &configuration).unwrap();
+        drop(store);
+        let store = Store::open_at(dir.clone()).unwrap();
+        assert_eq!(
+            store
+                .acp_session_state("side")
+                .unwrap()
+                .unwrap()
+                .configuration,
+            configuration
+        );
+        store.delete_chat_session("side").unwrap();
+        assert!(store.acp_session_state("side").unwrap().is_none());
+        assert!(store.acp_session_state("parent").unwrap().is_some());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -4523,15 +4640,15 @@ mod tests {
             .collect();
         assert_eq!(all, ["chat_parent"]);
         assert_eq!(store.side_chats_of("chat_parent").unwrap(), ["chat_side"]);
-        assert_eq!(store.side_chat_ids().unwrap(), ["chat_side"]);
         assert_eq!(
             store.chat_worktree_owner("chat_side").unwrap(),
             "chat_parent"
         );
         assert_eq!(store.chat_worktree_owner("chat_gone").unwrap(), "chat_gone");
-        // An orphan whose parent row is gone owns its own worktree again.
+        assert!(store.delete_chat_session("chat_parent").is_err());
+        assert!(store.get_chat_session("chat_parent").unwrap().is_some());
+        store.delete_chat_session("chat_side").unwrap();
         store.delete_chat_session("chat_parent").unwrap();
-        assert_eq!(store.chat_worktree_owner("chat_side").unwrap(), "chat_side");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

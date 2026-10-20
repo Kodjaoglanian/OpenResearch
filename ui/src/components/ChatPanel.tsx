@@ -4,6 +4,8 @@ import { fitSidebarRows, sidebarRowHeight, type SidebarRow } from "../sidebarLay
 import { useVirtualizer, defaultRangeExtractor, type Range as VirtualRange } from "@tanstack/react-virtual";
 import { markLiveUpdate } from "../queries/live";
 import { removeSession as removeCachedSession } from "../queries/invalidation";
+import { nativeOptions, sessionAcpHarness } from "../acp";
+import { setChatConfiguration } from "../api";
 import {
   isCurrentScope,
   setScopedQueryData,
@@ -66,6 +68,7 @@ import {
   SquareTerminal,
   ToggleRight,
   TriangleAlert,
+  Trash2,
   Users,
   WifiOff,
   X,
@@ -87,6 +90,7 @@ import {
   cancelQueuedMessage,
   chatAttachmentUrl,
   createChatSession,
+  openSideChat,
   getChatSession,
   deleteChatSession,
   DEMO_FIGURE_SESSION_ID,
@@ -187,7 +191,7 @@ import { ComposerSkillChips, MessageWithChips, skillMarginSpaces } from "./Skill
 import { WorkspaceConnection } from "./WorkspaceConnection";
 import {
   defaultSelection,
-  HARNESS_LABELS,
+  harnessLabel,
   ModelPicker,
   usePopover,
   type ModelSelection,
@@ -2738,7 +2742,7 @@ function PromptCard({
     const reason =
       (typeof p.toolInput?.reason === "string" && p.toolInput.reason) || "";
     const description = inputString(toolInput, "description") || "";
-    const explanation = reason || description || permissionActivityLabel(p.tool, toolInput);
+    const explanation = p.header || reason || description || permissionActivityLabel(p.tool, toolInput);
     const headingId = `permission-heading-${part.id}`;
     return (
       <div
@@ -2759,7 +2763,15 @@ function PromptCard({
               {summary}
             </code>
           )}
-          {!done && (
+          {!done && p.nativeChoices?.length ? (
+            <div className="prompt-actions flex flex-wrap items-center justify-end gap-2 pt-0.5">
+              {p.nativeChoices.map((choice) => (
+                <Button key={choice.id} size="small" onClick={() => respond({ answers: [choice.id], approve: choice.kind.startsWith("allow") })}>
+                  {choice.label}
+                </Button>
+              ))}
+            </div>
+          ) : !done && (
             // No resumeMode: the harness picks the right one for an approval.
             // Claude resumes under `bypassPermissions` (the only mode that grants a
             // blocked tool — acceptEdits would re-deny Bash); inline harnesses
@@ -4084,7 +4096,7 @@ function SessionRow({
       className={`session-row relative flex items-center gap-2 w-full text-start py-[7px] ps-2.5 pe-1.5 rounded-md text-sm text-text cursor-pointer select-none [&:hover:not(.active)]:bg-surface [&.active]:bg-panel [&.active]:font-medium [&_.session-dot:empty]:hidden [&_.session-dot]:w-4 [&_.session-dot]:inline-flex [&_.session-dot]:items-center [&_.session-dot]:justify-center [&_.session-dot]:shrink-0 [&_.session-title]:flex-1 [&_.session-title]:min-w-0 [&_.session-title]:overflow-hidden [&_.session-title]:[mask-image:linear-gradient(to_right,black_calc(100%_-_16px),transparent)] [&_.session-title]:whitespace-nowrap [&_.session-menu-btn]:hidden [&_.session-menu-btn]:items-center [&_.session-menu-btn]:justify-center [&_.session-menu-btn]:w-4 [&_.session-menu-btn]:h-4 [&_.session-menu-btn]:-my-0.5 [&_.session-menu-btn]:mx-0 [&_.session-menu-btn]:rounded-sm [&_.session-menu-btn]:text-muted [&_.session-menu-btn]:shrink-0 [&_.session-menu-btn:hover]:text-text [&_.session-menu-btn:hover]:bg-panel [&:hover_.session-menu-btn]:inline-flex [&:focus-visible_.session-menu-btn]:inline-flex [&_.session-menu-btn:focus-visible]:inline-flex [&.menu-open_.session-menu-btn]:inline-flex [&:hover_.session-dot]:hidden [&:focus-visible_.session-dot]:hidden [&:has(.session-menu-btn:focus-visible)_.session-dot]:hidden [&.menu-open_.session-dot]:hidden [&_.busy-dot]:w-[7px] [&_.busy-dot]:h-[7px] [&_.busy-dot]:rounded-full [&_.busy-dot]:bg-primary [&_.busy-dot]:animate-[or-pulse_1.2s_infinite] [&_.busy-dot]:shrink-0 [&_.unread-dot]:w-[7px] [&_.unread-dot]:h-[7px] [&_.unread-dot]:rounded-full [&_.unread-dot]:bg-primary [&_.unread-dot]:shrink-0 [&_.busy-dot.waiting]:animate-none [&_.session-title-input]:flex-1 [&_.session-title-input]:min-w-0 [&_.session-title-input]:py-px [&_.session-title-input]:px-[5px] [&_.session-title-input]:-my-0.5 [&_.session-title-input]:mx-0 [&_.session-title-input]:[font:inherit] [&_.session-title-input]:text-text [&_.session-title-input]:bg-background [&_.session-title-input]:border [&_.session-title-input]:border-primary [&_.session-title-input]:rounded-sm [&_.session-title-input]:outline-none [&.editing]:bg-surface [&.editing]:cursor-default [&.editing_.session-menu-btn]:hidden [&.editing_.session-dot]:hidden ${active ? "active" : ""}  ${unread ? "unread" : ""}  ${open ? "menu-open" : ""}  ${
         editing ? "editing" : ""
         }`}
-      title={`${HARNESS_LABELS[session.harness]}${session.model ? ` · ${session.model}` : ""}`}
+      title={`${harnessLabel(session.harness, session.harnessName)}${session.model ? ` · ${session.model}` : ""}`}
       onClick={() => {
         // While editing, a body click is a no-op; blur/Enter/Esc drive it.
         if (editing) return;
@@ -4254,7 +4266,6 @@ export function ChatPanel({
   onOpenPlan,
   onOpenSubagent,
   runtime,
-  onOpenDemoWelcome,
   composerFocusNonce = 0,
   activeSessionId,
   onActiveSessionChange,
@@ -4263,6 +4274,7 @@ export function ChatPanel({
   preferredAutonomy,
   onPreferredAutonomyChange,
   embedded = false,
+  sideParentSessionId,
   onOpenSideChat,
   onRunSetup,
   children,
@@ -4320,8 +4332,6 @@ export function ChatPanel({
     intent: TabOpenIntent,
   ) => void;
   runtime: RuntimeInfo;
-  /** Reopen the demo welcome modal from the chat header. */
-  onOpenDemoWelcome?: () => void;
   /** Increments when the demo welcome hands focus to the composer. */
   composerFocusNonce?: number;
   /** Demo run currently executing, for the monitor-it hint above the composer. */
@@ -4335,6 +4345,7 @@ export function ChatPanel({
   /** A second instance hosting a side chat in the right pane: no rail, and
    * global shortcuts act on it only while focus is inside it. */
   embedded?: boolean;
+  sideParentSessionId?: string;
   /** Branch a side chat off `parentSessionId`; a question, if given, is its first message. */
   onOpenSideChat?: (parentSessionId: string, question: string) => void;
   /** Middle-pane content when a settings section is active. */
@@ -4345,6 +4356,7 @@ export function ChatPanel({
   const setChatSessionAutonomyMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionAutonomy>) => setChatSessionAutonomy(...args) });
   const setChatSessionGoalMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionGoal>) => setChatSessionGoal(...args) });
   const importNativeChatMutation = useMutation({ mutationFn: (args: Parameters<typeof importNativeChat>) => importNativeChat(...args) });
+  const openSideChatMutation = useMutation({ mutationFn: openSideChat });
   const createChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof createChatSession>) => createChatSession(...args) });
   const setChatSessionArchivedMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionArchived>) => setChatSessionArchived(...args) });
   const renameChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof renameChatSession>) => renameChatSession(...args) });
@@ -4496,6 +4508,8 @@ export function ChatPanel({
   // active session changes. Distinct from `selection`, which is the sticky
   // global preference that seeds *new* sessions.
   const [sessionOverride, setSessionOverride] = useState<Partial<ModelSelection>>({});
+  const [sideDraftAutonomy, setSideDraftAutonomy] = useState<Autonomy | null>(null);
+  useEffect(() => setSideDraftAutonomy(null), [sideParentSessionId]);
   const [recoveryOverrides, setRecoveryOverrides] = useState<
     Partial<ModelSelection> & { planMode?: boolean }
   >(EMPTY_RECOVERY_OVERRIDES);
@@ -4702,9 +4716,12 @@ export function ChatPanel({
       ? { ...savedSelection, ...sessionOverride }
       : null;
   const { data: skills = EMPTY_SKILLS } = useQuery(getSkillsQuery(rawSelection?.harness, projectId));
-  const activeHarness = rawSelection
+  const catalogHarness = rawSelection
     ? harnesses.find((h) => h.id === rawSelection.harness)
     : undefined;
+  const activeHarness = sessionAcpHarness(openSession, catalogHarness);
+  const acpOptions = nativeOptions(openSession?.nativeConfiguration, { model: m.model_picker_model(), mode: m.model_picker_mode() });
+  const acpModel = acpOptions.find((option) => option.category === "model");
   const opts = activeHarness?.options;
   const { data: setupCommands } = useQuery({ ...getHarnessSetupCommandsQuery(), enabled: !!onRunSetup });
   const setupPath = (command: string) => {
@@ -4756,7 +4773,7 @@ export function ChatPanel({
   useEffect(() => setMentionIdx(0), [mentionQuery]);
   // Reconcile the selected model's settings, including stale saved preferences,
   // without replacing custom model IDs that are absent from the catalog.
-  const composerSelection = deriveComposerSelection(rawSelection, activeHarness);
+  const composerSelection = deriveComposerSelection(acpModel && rawSelection ? { ...rawSelection, model: acpModel.currentValue } : rawSelection, activeHarness);
   // Reasoning choices follow the *selected model*, not just the harness — an
   // OpenCode model with no `variants` hides the picker entirely, and Codex's
   // top tiers appear only on the models that accept them.
@@ -4785,6 +4802,10 @@ export function ChatPanel({
   // permission mode would write a reasoning level the user never chose, and the
   // next send would persist it over their real setting.
   const selectModel = (next: Partial<ModelSelection>) => {
+    if (openSession?.harness.startsWith("acp:") && acpModel && next.model) {
+      void setChatConfiguration(openSession.id, acpModel.id, next.model).catch((error: unknown) => showAlert(error instanceof Error ? error.message : String(error), "error"));
+      return;
+    }
     if (!composerSelection) return;
     const merged = { ...composerSelection, ...next };
     const changed: Partial<ModelSelection> = {};
@@ -4868,7 +4889,8 @@ export function ChatPanel({
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
   const setAutonomy = (autonomy: Autonomy) => {
     if (!openSession) {
-      onPreferredAutonomyChange(autonomy);
+      if (sideParentSessionId) setSideDraftAutonomy(autonomy);
+      else onPreferredAutonomyChange(autonomy);
       return;
     }
     const sessionId = openSession.id;
@@ -4968,7 +4990,8 @@ export function ChatPanel({
       case "new":
         // In a side chat, a new chat is another side chat off the same parent.
         if (embedded) {
-          if (openSession?.sideParentSessionId) onOpenSideChat?.(openSession.sideParentSessionId, "");
+          const parent = openSession?.sideParentSessionId ?? sideParentSessionId;
+          if (parent) onOpenSideChat?.(parent, "");
         } else startNewTask();
         return false;
       case "resume":
@@ -4999,7 +5022,7 @@ export function ChatPanel({
         const markdown = openSession
           ? transcriptMarkdown(title, messages, {
             user: m.chat_export_you(),
-            assistant: HARNESS_LABELS[openSession.harness],
+            assistant: harnessLabel(openSession.harness, openSession.harnessName),
           })
           : null;
         if (markdown) downloadMarkdown(transcriptFileName(title), markdown);
@@ -5821,19 +5844,24 @@ export function ChatPanel({
   async function openNewSession(selection: ModelSelection, planMode: boolean | undefined) {
     const scope = composerScopeRef.current;
     const visit = projectVisitRef.current;
-    const session = await createChatSessionMutation.mutateAsync([projectId, selection.harness, {
-      model: selection.model,
-      serviceTier: selection.serviceTier,
-      permissionMode: selection.permissionMode,
-      planMode,
-      reasoningLevel: selection.reasoningLevel,
-      autonomy: preferredAutonomy,
-    }]);
-    if (projectVisitRef.current === visit) {
+    let session = sideParentSessionId
+      ? await openSideChatMutation.mutateAsync(sideParentSessionId)
+      : await createChatSessionMutation.mutateAsync([projectId, selection.harness, {
+        model: selection.model,
+        serviceTier: selection.serviceTier,
+        permissionMode: selection.permissionMode,
+        planMode,
+        reasoningLevel: selection.reasoningLevel,
+        autonomy: preferredAutonomy,
+      }]);
+    if (sideParentSessionId && sideDraftAutonomy !== null && session.autonomy !== sideDraftAutonomy) {
+      session = await setChatSessionAutonomyMutation.mutateAsync([session.id, sideDraftAutonomy]);
+    }
+    if (isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit) {
       setSessions((cur) => [session, ...cur.filter((row) => row.id !== session.id)]);
       if (!queryClient.getQueryData(sessionsOptions.queryKey)) void syncSessionList(true);
     }
-    if (projectVisitRef.current === visit && composerScopeRef.current === scope) {
+    if (isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit && composerScopeRef.current === scope) {
       onActiveSessionChangeRef.current(session.id, { replace: true });
       composerScopeRef.current = { ...scope, activeId: session.id };
     }
@@ -6470,7 +6498,8 @@ export function ChatPanel({
         {railOpen && rail}
         <section className="chat-pane flex-1 min-w-0 flex flex-col bg-background min-h-0">
           {!railOpen && <div className="flex h-12 shrink-0 items-center">{railReopen}</div>}
-          <div className="settings-view-scroll flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
+          {/* Keyed per view so no tab inherits the chat thread's or another tab's scroll offset. */}
+          <div key={mainView} className="settings-view-scroll flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
             {contentError ? <div role="alert" className="p-6 text-subtext">{contentError}<Button onClick={onRetryContent}>{m.app_retry()}</Button></div>
               : contentLoading ? <LoadingRow className="p-6"><Spinner />{m.chat_panel_loading_conversation()}</LoadingRow> : children}
           </div>
@@ -6504,13 +6533,9 @@ export function ChatPanel({
               </span>
             </>}
           </div>
-          {onOpenDemoWelcome && (
-            <IconButton
-              data-tip={m.chat_panel_about_this_demo()}
-              aria-label={m.chat_panel_about_this_demo()}
-              onClick={onOpenDemoWelcome}
-            >
-              <HelpCircle size={15} />
+          {embedded && activeSession && (
+            <IconButton aria-label={m.side_chat_delete()} data-tip={m.side_chat_delete()} onClick={() => void removeSession(activeSession)}>
+              <Trash2 size={15} />
             </IconButton>
           )}
           </div>
@@ -6543,7 +6568,7 @@ export function ChatPanel({
               <div className="ms-auto h-16 w-1/2 shrink-0 rounded-lg bg-panel" />
             </div>
           </div>
-        ) : !threadMounted && activeSession?.sideParentSessionId ? (
+        ) : !threadMounted && (activeSession?.sideParentSessionId || sideParentSessionId) ? (
           <div className="chat-empty flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center text-subtext">
             <MessagesSquare size={22} />
             <p className="m-0 text-balance">{m.side_chat_empty()}</p>
@@ -6721,7 +6746,7 @@ export function ChatPanel({
             <PlanStrip
               synthesized={pendingPlan.synthesized}
               agentLabel={
-                activeSession ? HARNESS_LABELS[activeSession.harness] : m.chat_the_agent()
+                activeSession ? harnessLabel(activeSession.harness, activeSession.harnessName) : m.chat_the_agent()
               }
               showResumeModes={activeSession?.harness === "claude-code"}
               onView={(intent) => openPlan?.(pendingPlan.plan, pendingPlan.promptId, intent)}
@@ -6957,11 +6982,11 @@ export function ChatPanel({
                   pendingQuestion
                     ? m.chat_type_custom_answer()
                     : steering && activeHarness
-                      ? m.chat_steer_placeholder({ harness: ltr(HARNESS_LABELS[activeHarness.id]), shortcut: ltr(queueChord) })
+                      ? m.chat_steer_placeholder({ harness: ltr(activeHarness.name), shortcut: ltr(queueChord) })
                       : composerSelection
                         ? activeHarness?.agentReady
-                          ? m.chat_message_harness({ harness: ltr(HARNESS_LABELS[composerSelection.harness]) })
-                          : m.chat_harness_unavailable({ harness: ltr(HARNESS_LABELS[composerSelection.harness]) })
+                          ? m.chat_message_harness({ harness: ltr(harnessLabel(composerSelection.harness, activeHarness?.name)) })
+                          : m.chat_harness_unavailable({ harness: ltr(harnessLabel(composerSelection.harness, activeHarness?.name)) })
                         : m.chat_ask_agent_placeholder()
                 }
                 rows={2}
@@ -7183,6 +7208,7 @@ export function ChatPanel({
                 message. */}
               <div className="flex min-w-0 items-center">
                 <ModelPicker
+                  sessionHarness={openSession?.harness.startsWith("acp:") ? activeHarness : undefined}
                   value={composerSelection}
                   onSelect={selectModel}
                   onOpenSettings={() => onSelectMainView("harnesses")}
@@ -7192,10 +7218,15 @@ export function ChatPanel({
                   reasoningChoices={activeHarness?.agentReady ? reasoning.choices : []}
                   defaultReasoningId={reasoning.defaultId}
                   onSelectReasoning={setReasoningLevel}
-                  autonomy={openSession?.autonomy ?? preferredAutonomy}
+                  autonomy={openSession?.autonomy ?? sideDraftAutonomy ?? preferredAutonomy}
                   onSelectAutonomy={setAutonomy}
-                  lockHarness={!!openSession}
+                  lockHarness={!!openSession || !!sideParentSessionId}
                   openRequest={modelPickerRequest}
+                  nativeOptions={openSession?.harness.startsWith("acp:") ? acpOptions.filter((option) => option.category !== "model") : []}
+                  onSelectNativeOption={(optionId, value) => {
+                    if (!openSession) return;
+                    void setChatConfiguration(openSession.id, optionId, value).catch((error: unknown) => showAlert(error instanceof Error ? error.message : String(error), "error"));
+                  }}
                 />
                 <ContextMeter usage={openSession?.contextUsage} />
               </div>

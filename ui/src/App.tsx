@@ -1,5 +1,8 @@
 import {
   setScopedQueryData,
+  deletedSessionIds,
+  isCurrentScope,
+  workspaceScope,
   queryClient,
 } from "./queries/client";
 import { useMutation, useQuery } from "@tanstack/react-query";
@@ -17,7 +20,7 @@ import {
 
 import { listChatSessionsQuery, getChatMessagesQuery } from "./queries/chat";
 import { listProjectsQuery, getUiStateQuery, listRunsQuery, listExperimentsQuery } from "./queries/projects";
-import { deleteChatSession, openSideChat, sendChatMessage, setExperimentArchived } from "./api";
+import { openSideChat, sendChatMessage, setExperimentArchived } from "./api";
 import { getArtifactsQuery } from "./queries/files";
 import { readHarnesses } from "./queries/settings";
 import { useBlocker, useRouter, useRouterState } from "@tanstack/react-router";
@@ -67,12 +70,14 @@ import { useLocale } from "./locale";
 import { autoDir, ltr } from "./i18n";
 import {
   ChartSpline,
+  ArrowDownWideNarrow,
   Check,
   FileCode,
   Filter,
   FlaskConical,
   FolderGit2,
   FolderOpen,
+  GitBranch,
   Maximize2,
   MessagesSquare,
   Minimize2,
@@ -105,7 +110,7 @@ import { ProjectTerminal } from "./components/ProjectTerminal";
 import { SettingsCommandTerminal } from "./components/SshConnectTerminal";
 import { isWindowsDrivePath } from "./markdownTarget";
 import { ChatPanel, findPartById, spawnRowTitle } from "./components/ChatPanel";
-import { usePopover } from "./components/ModelPicker";
+import { OptionPicker, usePopover } from "./components/ModelPicker";
 import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab, type CodeView } from "./components/CodeTab";
 import { WorktreeTab, type WorktreeView } from "./components/WorktreeTab";
@@ -122,13 +127,14 @@ import { OfflineBanner } from "./components/OfflineBanner";
 import { NewProjectDialog } from "./components/ProjectsHome";
 import { ExperimentsTable } from "./components/ExperimentsTable";
 import { archiveActionsByExperiment } from "./components/ArchiveMenu";
+import { type HistoryOrder } from "./components/ExperimentLineage";
 import { Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { DemoWelcomeModal } from "./components/Tour";
 import { TreeView } from "./components/TreeView";
 import { onChatEvent, useOrxEvents } from "./events";
 import { closeTab, openTab, type TabOpenIntent } from "./tabPreview";
-import { Button, IconButton, MenuItem, showAlert, Spinner } from "./components/ui";
+import { Button, IconButton, MenuItem, showAlert, Spinner, Tooltip } from "./components/ui";
 import { CodeTabBody, TabBody } from "./components/layout/TabBody";
 import { RemoteStatus } from "./components/RemoteStatus";
 
@@ -374,6 +380,8 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const artifacts = artifactsQuery.data ?? null;
 
   const [view, setView] = useState<ExperimentsView>("table");
+  const [showTableLineage, setShowTableLineage] = useState(false);
+  const [tableOrder, setTableOrder] = useState<HistoryOrder>("lineage");
   const [showArchivedExperiments, setShowArchivedExperiments] = useState(false);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
   // Falls back to "project" whenever there is no usable experiment attribution.
@@ -802,7 +810,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (prefs) {
       setRailOpen(prefs.railOpen);
       setPanelWidth(Math.min(prefs.panelWidth, panelMaxWidth()));
-      setView(prefs.experimentsView);
+      setView(prefs.experimentsView === "tree" ? "tree" : "table");
     }
   }, [uiState]);
   useEffect(() => {
@@ -1274,7 +1282,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [forgetRightTab, rightTab, subagentTabs],
   );
 
-  const openSideTab = useCallback((sessionId: string) => {
+  const openSideTab = useCallback((sessionId: string | null) => {
     const tab: SideChatViewDef = { kind: "side", sessionId };
     setSideTabs((prev) => prev.some((t) => t.sessionId === sessionId) ? prev : [...prev, tab]);
     setPanelWidth((width) => Math.max(width, sideChatPanelWidth()));
@@ -1290,14 +1298,19 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [forgetRightTab, rightTab, sideTabs],
   );
 
-  // Side chats are deleted when orx restarts; drop saved tabs whose chat is gone.
+  // Drop saved tabs only when their persisted session has been deleted.
   useEffect(() => {
     const live = sessionsQuery.data;
     if (!live) return;
-    for (const tab of sideTabs) if (!live.some((session) => session.id === tab.sessionId)) forgetSideTab(tab);
+    for (const tab of sideTabs) if (tab.sessionId !== null && !live.some((session) => session.id === tab.sessionId)) forgetSideTab(tab);
   }, [sessionsQuery.data, sideTabs, forgetSideTab]);
 
   const startSideChat = useCallback(async (parentSessionId: string, question: string) => {
+    if (!question.trim()) {
+      openSideTab(null);
+      return;
+    }
+    const scope = workspaceScope();
     let session;
     try {
       session = await openSideChat(parentSessionId);
@@ -1305,16 +1318,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       showAlert(m.side_chat_open_failed({ error: errorText(error) }), "error");
       return;
     }
-    // The user moved to another task while it opened; its tab belongs nowhere now.
-    if (navigationRef.current.activeSessionId !== parentSessionId) {
-      void deleteChatSession(session.id).catch((error) => {
-        showAlert(m.side_chat_close_failed({ error: errorText(error) }), "error");
-      });
-      return;
-    }
+    if (!isCurrentScope(scope) || deletedSessionIds.has(session.id) || deletedSessionIds.has(parentSessionId)) return;
     setScopedQueryData(listChatSessionsQuery(session.projectId).queryKey, (current) =>
       current && [session, ...current.filter((row) => row.id !== session.id)]);
-    openSideTab(session.id);
+    if (navigationRef.current.activeSessionId === parentSessionId) openSideTab(session.id);
     if (!question) return;
     try {
       // Seed the transcript first so the live stream has a cache to land the question in.
@@ -1325,16 +1332,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     }
   }, [openSideTab]);
 
-  // Side chats are temporary: closing the tab is what deletes one.
-  const closeSideTab = useCallback(
-    (tab: SideChatViewDef) => {
-      forgetSideTab(tab);
-      void deleteChatSession(tab.sessionId).catch((error) => {
-        showAlert(m.side_chat_close_failed({ error: errorText(error) }), "error");
-      });
-    },
-    [forgetSideTab],
-  );
+  const closeSideTab = forgetSideTab;
 
   // Live title + running state for open sub-agent tabs, straight off the spawn
   // parts' message stream — so a tab is named for its task and shimmers while
@@ -1581,6 +1579,16 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       ? rightTab
       : null;
   const sideSession = sideTab ? sessionsQuery.data?.find((session) => session.id === sideTab.sessionId) : undefined;
+  const sideParentSession = sessionsQuery.data?.find((session) => session.id === activeSessionId);
+  const sideDraftAgent = useMemo(() => sideParentSession ? {
+    harness: sideParentSession.harness,
+    model: sideParentSession.model,
+    serviceTier: sideParentSession.serviceTier,
+    permissionMode: sideParentSession.permissionMode === "plan" ? null : sideParentSession.permissionMode,
+    reasoningLevel: sideParentSession.reasoningLevel,
+  } : null, [sideParentSession?.harness, sideParentSession?.model,
+    sideParentSession?.serviceTier, sideParentSession?.permissionMode,
+    sideParentSession?.reasoningLevel]);
   const requestedCodeTab =
     typeof rightTab === "object" && "code" in rightTab ? rightTab : null;
   const codeTab = requestedCodeTab
@@ -1658,7 +1666,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
         <ClosableTab
           key={rightTabKey(tab)}
           active={sideTab !== null && sideTab.sessionId === tab.sessionId}
-          label={session?.title?.trim() || m.side_chat_open()}
+          label={tab.sessionId === null ? m.side_chat_new() : session?.title?.trim() || m.side_chat_open()}
           shimmer={session?.busy ?? false}
           icon={<MessagesSquare size={12} className="shrink-0" />}
           preview={isPreviewTab(tab)}
@@ -1774,9 +1782,6 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             onRunSetup={runtime.kind === "ssh" ? undefined : runSetup}
             composerFocusNonce={composerFocusNonce}
             runtime={runtime}
-            onOpenDemoWelcome={
-              activeProject && isDemoProjectId(activeProject.id) ? openDemoWelcome : undefined
-            }
             activeSessionId={activeSessionId}
             onActiveSessionChange={onActiveSessionChange}
             preferredAgent={uiState.preferredAgent}
@@ -1817,6 +1822,8 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             onArtifacts={openArtifactsTab}
             onExperiments={() => openExperimentsTab()}
             onSideChat={activeSessionId ? () => void startSideChat(activeSessionId, "") : undefined}
+            sessions={sessionsQuery.data ?? []}
+            onSelectSideChat={openSideTab}
           />
         )}
         {mainView === "chat" && panelOpen && (
@@ -1915,8 +1922,43 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             ) : rightTab === "experiments" ? (
               <TabBody>
                 <div className="pane-toolbar flex shrink-0 flex-wrap items-center gap-2 bg-background px-3 pt-2.5 pb-2">
-                  <span className="flex-1" />
-                  <div className="experiments-toolbar-controls inline-flex items-center gap-[5px]">
+                  <div className="experiments-toolbar-controls flex w-full items-center gap-[5px]">
+                    {view === "table" && (
+                      <Tooltip interactive content={m.history_order()}>
+                      <OptionPicker
+                        triggerIcon={<ArrowDownWideNarrow size={16} />}
+                        choices={[
+                          { id: "lineage", label: m.history_lineage() },
+                          { id: "oldest", label: m.history_order_oldest() },
+                          { id: "newest", label: m.history_order_newest() },
+                        ]}
+                        value={tableOrder}
+                        header={m.history_order()}
+                        title={m.history_order()}
+                        variant="bare"
+                        dropDown
+                        align="left"
+                        onSelect={(id) => {
+                          if (id === "lineage" || id === "oldest" || id === "newest") setTableOrder(id);
+                        }}
+                      />
+                      </Tooltip>
+                    )}
+                    {view === "table" && (
+                      <Tooltip interactive content={m.history_show_lineage()}>
+                        <IconButton
+                          size="small"
+                          active={showTableLineage && tableOrder === "lineage"}
+                          className="[&.active]:text-text"
+                          disabled={tableOrder !== "lineage"}
+                          aria-label={m.history_show_lineage()}
+                          aria-pressed={showTableLineage && tableOrder === "lineage"}
+                          onClick={() => setShowTableLineage((show) => !show)}
+                        >
+                          <GitBranch size={16} />
+                        </IconButton>
+                      </Tooltip>
+                    )}
                     <div className="option-picker relative inline-flex" ref={scopeMenuRef}>
                       <IconButton size="small"
                         ref={scopeTriggerRef}
@@ -1930,7 +1972,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                         <Filter size={16} strokeWidth={2.5} />
                       </IconButton>
                       {scopeMenuOpen && (
-                        <div className="option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 drop-down align-right experiment-scope-menu [&_.model-item]:whitespace-nowrap [&_.model-item:disabled]:text-muted [&_.model-item:disabled]:cursor-default [&_.model-item:disabled:hover]:bg-transparent">
+                        <div className="option-menu absolute bottom-[calc(100%_+_8px)] start-0 max-h-95 flex flex-col bg-background border border-border rounded-lg shadow-menu z-50 overflow-hidden min-w-47.5 p-1.5 [&.align-right]:start-auto [&.align-right]:end-0 [&.drop-down]:bottom-auto [&.drop-down]:top-[calc(100%_+_4px)] [&.session-menu]:start-auto [&.session-menu]:end-1.5 [&.session-menu]:top-[calc(100%_-_2px)] [&.session-menu]:min-w-35 drop-down experiment-scope-menu [&_.model-item]:whitespace-nowrap [&_.model-item:disabled]:text-muted [&_.model-item:disabled]:cursor-default [&_.model-item:disabled:hover]:bg-transparent">
                           <MenuItem
                             aria-pressed={effectiveScope === "agent"}
                             disabled={!activeSessionId || !allExperimentsAttributed}
@@ -1973,6 +2015,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                         </div>
                       )}
                     </div>
+                    <span className="flex-1" />
                     <div
                       className="seg inline-flex items-center gap-0.5 rounded-md bg-hover-subtle [&_button]:font-medium [&_button]:text-text [&_button]:rounded-sm [&_button:not(:disabled):hover]:text-text [&_button.active]:bg-background [&_button.active]:shadow-segment [&_button:disabled]:text-muted [&_button:disabled]:cursor-default experiments-view-toggle p-0.5 [&_button]:py-0.5 [&_button]:px-2 [&_button]:text-sm"
                       role="group"
@@ -2014,8 +2057,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                         onViewportChange={setTreeViewport}
                       />
                     )
-                  ) : (
+                  ) : view === "table" ? (
                     <ExperimentsTable
+                      showLineage={showTableLineage && tableOrder === "lineage"}
+                      order={tableOrder}
                       archiveActions={archiveActions}
                       runs={scopedRuns}
                       emptyHint={
@@ -2045,7 +2090,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       onArchive={archiveExperiment}
                       onCancel={cancelRun}
                     />
-                  )}
+                  ) : null}
                 </div>
               </TabBody>
             ) : rightTab === "files" ? (
@@ -2175,10 +2220,9 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
               </TabBody>
             ) : sideTab && projectId ? (
               <TabBody>
-                {sideSession ? (
+                {sideSession || sideTab.sessionId === null ? (
                   <div className="flex min-h-0 flex-1">
                     <ChatPanel
-                      key={sideTab.sessionId}
                       embedded
                       projectId={projectId}
                       projectName={activeProject?.name ?? ""}
@@ -2203,17 +2247,32 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       }
                       runtime={runtime}
                       activeSessionId={sideTab.sessionId}
+                      sideParentSessionId={sideTab.sessionId === null ? activeSessionId ?? undefined : undefined}
                       onOpenSideChat={(parentSessionId, question) => void startSideChat(parentSessionId, question)}
                       onActiveSessionChange={(sessionId, options) => {
+                        if (sideTab.sessionId === null && sessionId !== null) {
+                          const session = queryClient.getQueryData(listChatSessionsQuery(projectId).queryKey)
+                            ?.find((row) => row.id === sessionId);
+                          if (session?.sideParentSessionId !== activeSessionId) {
+                            onActiveSessionChange(sessionId, options);
+                            return;
+                          }
+                          const navigation = navigationRef.current;
+                          if (navigation.activeSessionId !== activeSessionId || navigation.pane?.kind !== "side" || navigation.pane.sessionId !== null) return;
+                          setSideTabs((current) => current.filter((tab) => tab.sessionId !== null));
+                          forgetRightTab(sideTab, false);
+                          openSideTab(sessionId);
+                          return;
+                        }
                         // Null after a delete drops the tab; anything else (`/resume`) is the main chat's.
                         const deleted = !queryClient.getQueryData(listChatSessionsQuery(projectId).queryKey)
                           ?.some((session) => session.id === sideTab.sessionId);
                         if (sessionId === null && deleted) forgetSideTab(sideTab);
                         else onActiveSessionChange(sessionId, options);
                       }}
-                      preferredAgent={uiState.preferredAgent}
+                      preferredAgent={sideTab.sessionId === null ? sideDraftAgent : uiState.preferredAgent}
                       onPreferredAgentChange={persistPreferredAgent}
-                      preferredAutonomy={uiState.preferredAutonomy ?? DEFAULT_AUTONOMY}
+                      preferredAutonomy={sideTab.sessionId === null ? sideParentSession?.autonomy ?? DEFAULT_AUTONOMY : uiState.preferredAutonomy ?? DEFAULT_AUTONOMY}
                       onPreferredAutonomyChange={persistPreferredAutonomy}
                     />
                   </div>
@@ -2283,6 +2342,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                   <DetailDrawer
                     key={`${expTab.id}:${expTab.view}`}
                     experiment={tabExperiment}
+                    experiments={experiments}
+                    onOpenExperiment={(id, intent) =>
+                      openFromRightTab(expTab, () => openExperimentTab(id, "overview", intent))
+                    }
                     project={activeProject}
                     view={expTab.view}
                     runs={runs}
