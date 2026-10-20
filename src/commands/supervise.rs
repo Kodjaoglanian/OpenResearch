@@ -259,13 +259,16 @@ fn should_report_cancelled(store: &Store, run_id: &str, cancel_sent: bool) -> bo
 }
 
 fn run_status_for_stage(store: &Store, run_id: &str, cancel_sent: bool, stage: &str) -> RunStatus {
-    let status = if stage == "LOST" {
-        RunStatus::Lost
-    } else {
-        stage_to_run_status(stage)
-    };
+    if stage == "LOST" {
+        return if cancel_sent {
+            RunStatus::Cancelled
+        } else {
+            RunStatus::Lost
+        };
+    }
+    let status = stage_to_run_status(stage);
     if status != RunStatus::Done
-        && (is_terminal_stage(stage) || stage == "LOST")
+        && is_terminal_stage(stage)
         && should_report_cancelled(store, run_id, cancel_sent)
     {
         RunStatus::Cancelled
@@ -1681,6 +1684,14 @@ mod tests {
             RunStatus::Failed
         );
         assert!(store.request_cancel(&run.id, "test").unwrap());
+        assert_eq!(
+            run_status_for_stage(&store, &run.id, false, "LOST"),
+            RunStatus::Lost
+        );
+        assert_eq!(
+            run_status_for_stage(&store, &run.id, true, "LOST"),
+            RunStatus::Cancelled
+        );
         assert_eq!(
             run_status_for_stage(&store, &run.id, false, "ERROR"),
             RunStatus::Cancelled
