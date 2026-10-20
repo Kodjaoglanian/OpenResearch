@@ -616,6 +616,7 @@ export function OptionPicker({
   const menuRef = useRef<HTMLDivElement>(null);
   const [filter, setFilter] = useState("");
   const openedByHover = useRef(false);
+  const touchTrigger = useRef(false);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(closeTimer.current), []);
   useLayoutEffect(() => {
@@ -667,7 +668,7 @@ export function OptionPicker({
   const activateTrigger = () => {
     openedByHover.current = false;
     setFilter("");
-    if (onTriggerClick) {
+    if (onTriggerClick && !touchTrigger.current) {
       setOpen(false);
       onTriggerClick();
     } else {
@@ -709,8 +710,10 @@ export function OptionPicker({
           aria-haspopup="menu"
           aria-expanded={open}
           disabled={disabled}
+          onPointerDown={(event) => { touchTrigger.current = event.pointerType === "touch"; }}
           onClick={activateTrigger}
           onKeyDown={(event) => {
+            touchTrigger.current = false;
             if (!onTriggerClick || event.key !== "ArrowDown") return;
             event.preventDefault();
             openedByHover.current = false;

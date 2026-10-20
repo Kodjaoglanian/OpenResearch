@@ -4508,6 +4508,8 @@ export function ChatPanel({
   // active session changes. Distinct from `selection`, which is the sticky
   // global preference that seeds *new* sessions.
   const [sessionOverride, setSessionOverride] = useState<Partial<ModelSelection>>({});
+  const [sideDraftAutonomy, setSideDraftAutonomy] = useState<Autonomy | null>(null);
+  useEffect(() => setSideDraftAutonomy(null), [sideParentSessionId]);
   const [recoveryOverrides, setRecoveryOverrides] = useState<
     Partial<ModelSelection> & { planMode?: boolean }
   >(EMPTY_RECOVERY_OVERRIDES);
@@ -4887,7 +4889,8 @@ export function ChatPanel({
   const setReasoningLevel = (id: string) => selectModel({ reasoningLevel: id });
   const setAutonomy = (autonomy: Autonomy) => {
     if (!openSession) {
-      onPreferredAutonomyChange(autonomy);
+      if (sideParentSessionId) setSideDraftAutonomy(autonomy);
+      else onPreferredAutonomyChange(autonomy);
       return;
     }
     const sessionId = openSession.id;
@@ -5841,7 +5844,7 @@ export function ChatPanel({
   async function openNewSession(selection: ModelSelection, planMode: boolean | undefined) {
     const scope = composerScopeRef.current;
     const visit = projectVisitRef.current;
-    const session = sideParentSessionId
+    let session = sideParentSessionId
       ? await openSideChatMutation.mutateAsync(sideParentSessionId)
       : await createChatSessionMutation.mutateAsync([projectId, selection.harness, {
         model: selection.model,
@@ -5851,6 +5854,9 @@ export function ChatPanel({
         reasoningLevel: selection.reasoningLevel,
         autonomy: preferredAutonomy,
       }]);
+    if (sideParentSessionId && sideDraftAutonomy !== null && session.autonomy !== sideDraftAutonomy) {
+      session = await setChatSessionAutonomyMutation.mutateAsync([session.id, sideDraftAutonomy]);
+    }
     if (isCurrentScope(sessionsOptions.queryKey) && projectVisitRef.current === visit) {
       setSessions((cur) => [session, ...cur.filter((row) => row.id !== session.id)]);
       if (!queryClient.getQueryData(sessionsOptions.queryKey)) void syncSessionList(true);
@@ -7212,7 +7218,7 @@ export function ChatPanel({
                   reasoningChoices={activeHarness?.agentReady ? reasoning.choices : []}
                   defaultReasoningId={reasoning.defaultId}
                   onSelectReasoning={setReasoningLevel}
-                  autonomy={openSession?.autonomy ?? preferredAutonomy}
+                  autonomy={openSession?.autonomy ?? sideDraftAutonomy ?? preferredAutonomy}
                   onSelectAutonomy={setAutonomy}
                   lockHarness={!!openSession || !!sideParentSessionId}
                   openRequest={modelPickerRequest}
